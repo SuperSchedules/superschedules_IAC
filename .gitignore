@@ -1,3 +1,15 @@
 node_modules
 .pnpm-store
 .venv/
+
+# Terraform local state and caches (do not commit)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfvars
+terraform.tfvars.json
