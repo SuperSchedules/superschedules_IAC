@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+REGION=${region}
+APP_DIR=/opt/superschedules
+mkdir -p "$APP_DIR"
+
+# Install Docker and compose plugin
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg lsb-release awscli
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \\n+    $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
+    tee /etc/apt/sources.list.d/docker.list >/dev/null
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable docker
+  systemctl start docker
+fi
+
+# ECR login
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${region}.amazonaws.com
+
+cat > "$APP_DIR/docker-compose.yml" <<'YAML'
+version: "3.9"
+services:
+  nginx:
+    image: ${nginx_image}
+    ports:
+      - "80:80"
+    depends_on:
+      - django
+      - fastapi
+    environment:
+      - FORWARD_DJANGO=http://django:8000
+      - FORWARD_FASTAPI=http://fastapi:8000
+  django:
+    image: ${django_image}
+    environment:
+      - DJANGO_SETTINGS_MODULE=${django_settings_module}
+      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+      - AWS_REGION=${region}
+      - AWS_S3_BUCKET=${static_bucket}
+    depends_on:
+      - wait-for-db
+  fastapi:
+    image: ${fastapi_image}
+    environment:
+      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+      - AWS_REGION=${region}
+      - AWS_S3_BUCKET=${static_bucket}
+    depends_on:
+      - wait-for-db
+  collector:
+    image: ${collector_image}
+    environment:
+      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+      - AWS_REGION=${region}
+      - AWS_S3_BUCKET=${static_bucket}
+    depends_on:
+      - wait-for-db
+  wait-for-db:
+    image: public.ecr.aws/bitnami/postgresql:15
+    command: ["/bin/bash", "-lc", "until pg_isready -h ${db_host} -p ${db_port} -U ${db_username}; do echo waiting for db; sleep 3; done"]
+YAML
+
+cat > /etc/systemd/system/superschedules.service <<'UNIT'
+[Unit]
+Description=Superschedules stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/superschedules
+ExecStartPre=/usr/bin/aws ecr get-login-password --region ${region} | /usr/bin/docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${region}.amazonaws.com
+ExecStart=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml up -d
+ExecStop=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml down
+TimeoutStartSec=0
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable superschedules
+systemctl start superschedules
+
+echo "Bootstrapping complete"
+
