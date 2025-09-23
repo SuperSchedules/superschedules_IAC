@@ -1,0 +1,27 @@
+# Required images (use tags pushed by GitHub Actions)
+nginx_image     = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-frontend:latest"
+django_image    = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-api:latest"
+fastapi_image   = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-navigator:latest"
+collector_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-collector:latest"
+
+# S3 bucket name must be globally unique
+static_bucket_name = "superschedules-prod-static-123456789012"
+
+# Optional overrides
+# aws_region            = "us-east-1"
+# app_instance_type     = "t3.small"
+# django_settings_module = "config.settings.production"
+# health_check_path     = "/"
+
+# Optional DB settings (password is generated if unset)
+# db_engine_version = "15"
+# db_instance_class = "db.t3.micro"
+# db_name           = "superschedules"
+# db_username       = "superschedules"
+# db_password       = "change-me-strong-password"
+
+# Optional networking (defaults define a new VPC)
+# vpc_cidr            = "10.0.0.0/16"
+# public_subnet_cidrs = ["10.0.0.0/24", "10.0.1.0/24"]
+# private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
