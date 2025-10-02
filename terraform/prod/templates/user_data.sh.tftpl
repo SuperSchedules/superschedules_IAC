@@ -112,8 +112,5 @@ docker exec $(docker ps -qf "name=django") python manage.py shell -c "from djang
 # Run Django migrations (creates tables and enables pgvector)
 docker exec $(docker ps -qf "name=django") python manage.py migrate --noinput || echo "Migration failed - may need manual intervention"
 
-# Collect static files (if needed)
-docker exec $(docker ps -qf "name=django") python manage.py collectstatic --noinput || echo "Collectstatic failed - may need manual intervention"
-
 echo "Bootstrapping complete"
 
