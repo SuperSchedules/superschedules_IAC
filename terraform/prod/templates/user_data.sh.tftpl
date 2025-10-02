@@ -14,7 +14,7 @@ if command -v apt-get >/dev/null 2>&1; then
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
   chmod a+r /etc/apt/keyrings/docker.gpg
   echo \
-    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \\n+    $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
     tee /etc/apt/sources.list.d/docker.list >/dev/null
   apt-get update -y
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -26,39 +26,50 @@ fi
 aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${region}.amazonaws.com
 
 cat > "$APP_DIR/docker-compose.yml" <<'YAML'
-version: "3.9"
 services:
-  nginx:
+  frontend:
     image: ${nginx_image}
     ports:
       - "80:80"
-    depends_on:
-      - django
-      - fastapi
-    environment:
-      - FORWARD_DJANGO=http://django:8000
-      - FORWARD_FASTAPI=http://fastapi:8000
   django:
     image: ${django_image}
+    ports:
+      - "8000:8000"
     environment:
       - DJANGO_SETTINGS_MODULE=${django_settings_module}
-      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+      - DB_HOST=${db_host}
+      - DB_PORT=${db_port}
+      - DB_NAME=${db_name}
+      - DB_USER=${db_username}
+      - DB_PASSWORD=${db_password}
       - AWS_REGION=${region}
       - AWS_S3_BUCKET=${static_bucket}
+      - ALB_HOST=${alb_dns_name}
+      - DEBUG=False
+      - LLM_PROVIDER=bedrock
+      - AWS_BEDROCK_REGION=${region}
     depends_on:
       - wait-for-db
-  fastapi:
+  # collector:
+  #   image: ${collector_image}
+  #   ports:
+  #     - "8001:8001"
+  #   environment:
+  #     - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+  #     - AWS_REGION=${region}
+  #     - AWS_S3_BUCKET=${static_bucket}
+  #   depends_on:
+  #     - wait-for-db
+  navigator:
     image: ${fastapi_image}
+    ports:
+      - "8004:8004"
     environment:
-      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
-      - AWS_REGION=${region}
-      - AWS_S3_BUCKET=${static_bucket}
-    depends_on:
-      - wait-for-db
-  collector:
-    image: ${collector_image}
-    environment:
-      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+      - DB_HOST=${db_host}
+      - DB_PORT=${db_port}
+      - DB_NAME=${db_name}
+      - DB_USER=${db_username}
+      - DB_PASSWORD=${db_password}
       - AWS_REGION=${region}
       - AWS_S3_BUCKET=${static_bucket}
     depends_on:
@@ -68,7 +79,7 @@ services:
     command: ["/bin/bash", "-lc", "until pg_isready -h ${db_host} -p ${db_port} -U ${db_username}; do echo waiting for db; sleep 3; done"]
 YAML
 
-cat > /etc/systemd/system/superschedules.service <<'UNIT'
+cat > /etc/systemd/system/superschedules.service <<UNIT
 [Unit]
 Description=Superschedules stack
 After=docker.service
@@ -78,7 +89,7 @@ Requires=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/superschedules
-ExecStartPre=/usr/bin/aws ecr get-login-password --region ${region} | /usr/bin/docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${region}.amazonaws.com
+ExecStartPre=/bin/bash -c 'aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${region}.amazonaws.com'
 ExecStart=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml up -d
 ExecStop=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml down
 TimeoutStartSec=0
@@ -91,6 +102,18 @@ UNIT
 systemctl daemon-reload
 systemctl enable superschedules
 systemctl start superschedules
+
+# Wait for services to be healthy
+sleep 30
+
+# Enable pgvector extension (idempotent)
+docker exec $(docker ps -qf "name=django") python manage.py shell -c "from django.db import connection; cursor = connection.cursor(); cursor.execute('CREATE EXTENSION IF NOT EXISTS vector;'); print('pgvector extension enabled')" || echo "pgvector extension creation failed"
+
+# Run Django migrations (creates tables and enables pgvector)
+docker exec $(docker ps -qf "name=django") python manage.py migrate --noinput || echo "Migration failed - may need manual intervention"
+
+# Collect static files (if needed)
+docker exec $(docker ps -qf "name=django") python manage.py collectstatic --noinput || echo "Collectstatic failed - may need manual intervention"
 
 echo "Bootstrapping complete"
 

@@ -1,3 +1,5 @@
+data "aws_caller_identity" "current" {}
+
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -42,6 +44,29 @@ resource "aws_iam_policy" "s3_access" {
 resource "aws_iam_role_policy_attachment" "s3_access" {
   role       = aws_iam_role.ec2.name
   policy_arn = aws_iam_policy.s3_access.arn
+}
+
+data "aws_iam_policy_document" "bedrock_access" {
+  statement {
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream"
+    ]
+    resources = [
+      "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+      "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+    ]
+  }
+}
+
+resource "aws_iam_policy" "bedrock_access" {
+  name   = "superschedules-prod-bedrock-access"
+  policy = data.aws_iam_policy_document.bedrock_access.json
+}
+
+resource "aws_iam_role_policy_attachment" "bedrock_access" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = aws_iam_policy.bedrock_access.arn
 }
 
 resource "aws_iam_instance_profile" "ec2" {
