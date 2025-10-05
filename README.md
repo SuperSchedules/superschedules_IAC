@@ -25,8 +25,26 @@ make dev-local
 # Run setup scripts locally and install dotfiles
 make dev-local INSTALL_DOTFILES=true
 
-# Provision the production EC2 instance
+# Provision/refresh the production environment (blue/green aware)
 make prod-deploy
+
+# Prepare a new green fleet at full capacity while keeping blue live
+make deploy:new-green GREEN_CAPACITY=2
+
+# Shift 10% of traffic to green for a canary
+make deploy:canary-10
+
+# Move to a 50/50 canary split
+make deploy:canary-50
+
+# Send 100% of traffic to green
+make deploy:flip
+
+# After monitoring, retire blue capacity (defaults to 3 minute drain)
+make deploy:retire-blue DRAIN_WAIT=300
+
+# Roll back to blue immediately
+make deploy:rollback
 ```
 
 The development configuration uses two resources:
@@ -45,7 +63,89 @@ The following setup scripts under `terraform/dev/scripts` clone or update reposi
 - `setup_superschedules_collector.sh` for [superschedules_collector](https://github.com/gkirkpatrick/superschedules_collector) and its Python virtual environment.
 - `setup_superschedules_navigator.sh` for [superschedules_navigator](https://github.com/gkirkpatrick/superschedules_navigator) and its Python virtual environment.
 
-An `aws_instance` resource named `dev` and a similar `prod` instance have been added as starting points for hosting the environments on AWS. Provide the `ssh_key_name` variable to supply your existing key pair.
+## Production blue/green deployment
+
+The production environment is managed through the reusable module in `modules/service_bluegreen`. It provisions paired blue/green target groups and Auto Scaling Groups that share a single launch template and ALB listener. The module wires listener weights, lifecycle hooks, and readiness outputs so that one Terraform apply (or the Make targets above) is all that is required to move traffic between fleets with zero downtime.
+
+A minimal, self-contained example that wires the module to an existing ALB and launch template is included in `envs/prod/main.tf`.
+
+### Ready-to-flip gating
+
+The module exports `bluegreen_ready_to_flip` and `bluegreen_readiness` to gate production flips. Before changing weights, run:
+
+```sh
+terraform -chdir=terraform/prod apply -refresh-only
+terraform -chdir=terraform/prod output bluegreen_readiness
+terraform -chdir=terraform/prod output bluegreen_ready_to_flip
+```
+
+`ready_to_flip` will only become `true` after every instance in the standby color is `InService` and healthy according to the ALB `/ready` check. Keep `enable_instance_protection = true` during flips so that Auto Scaling does not scale the target color in while you are switching traffic.
+
+### Lifecycle hook bootstrap
+
+Each Auto Scaling Group has a launch lifecycle hook that pauses new instances until your bootstrap logic signals readiness. The following Systems Manager Run Command snippet installs dependencies and completes the hook only after the `/ready` endpoint succeeds:
+
+```sh
+aws ssm send-command \
+  --document-name "AWS-RunShellScript" \
+  --targets "Key=tag:aws:autoscaling:groupName,Values=superschedules-prod-asg-green" \
+  --comment "Bootstrap and signal readiness" \
+  --parameters '{"commands":[
+    "#!/bin/bash",
+    "set -euo pipefail",
+    "# run bootstrap here",
+    "/usr/bin/aws autoscaling complete-lifecycle-action --lifecycle-hook-name superschedules-prod-green-launch --auto-scaling-group-name superschedules-prod-asg-green --lifecycle-action-token $LIFECYCLE_ACTION_TOKEN --lifecycle-action-result CONTINUE"
+  ]}'
+```
+
+Replace the comment section with your actual provisioning commands. Use `ABANDON` instead of `CONTINUE` if bootstrap fails so the instance is terminated automatically.
+
+### Plan milestones
+
+The table below documents the expected Terraform plan deltas for each deployment stage:
+
+```text
+# Initial blue-only deployment
+# module.service_bluegreen.aws_autoscaling_group.this["green"] will be created
+# module.service_bluegreen.aws_lb_target_group.this["green"] will be created
+
+# Introduce green capacity (make deploy:new-green)
+# module.service_bluegreen.aws_autoscaling_group.this["green"]: desired_capacity from 0 to N
+
+# Canary 10/90 (make deploy:canary-10)
+# module.service_bluegreen.aws_lb_listener.this[0] default action weights: blue=90, green=10
+
+# Canary 50/50 (make deploy:canary-50)
+# module.service_bluegreen.aws_lb_listener.this[0] default action weights: blue=50, green=50
+
+# Full flip (make deploy:flip)
+# module.service_bluegreen.aws_lb_listener.this[0] default action forwards 100% to green
+
+# Retire blue (make deploy:retire-blue)
+# module.service_bluegreen.aws_autoscaling_group.this["blue"] desired_capacity from current to 0
+```
+
+Run `terraform -chdir=terraform/prod plan` with the appropriate `-var` overrides from the Make targets to see the complete diff before each stage.
+
+### Rollback
+
+To roll back, run `make deploy:rollback`. This sends 100% of traffic back to blue while keeping the green ASG online so you can investigate. If you also want to scale green down, follow with `make deploy:new-green GREEN_CAPACITY=0`.
+
+### Migration guide
+
+1. Import existing single-color resources into state:
+   ```sh
+   terraform -chdir=terraform/prod import module.service_bluegreen.aws_lb_listener.this[0] <listener-arn>
+   terraform -chdir=terraform/prod import module.service_bluegreen.aws_lb_target_group.this["blue"] <existing-tg-arn>
+   terraform -chdir=terraform/prod import module.service_bluegreen.aws_autoscaling_group.this["blue"] <existing-asg-name>
+   ```
+2. Apply with `green_desired_capacity = 0` so the new resources (green ASG/TG) are created alongside the live blue stack.
+3. Run `make deploy:new-green` to spin up green instances on the new target group.
+4. Walk through the canary and flip commands above.
+
+If importing the listener is not desirable, set `listener_arn = null` and Terraform will create a fresh listener that can be promoted once traffic is off the legacy resources.
+
+When `listener_arn` is supplied the module installs an all-path (`/*`) listener rule instead of modifying the default action so the pre-existing listener is never replaced. Ensure there are no higher-priority rules that would override this catch-all route.
 
 ## Docker and CI/CD
 
@@ -105,4 +205,4 @@ docker run -p 3000:80 superschedules-frontend
 - **Navigator**: 8004 (FastAPI)  
 - **Frontend**: 3000 (nginx)
 
-All services expose health endpoints at `/health`, `/live`, and `/ready`.
+All services expose health endpoints at `/health`, `/live`, and `/ready`. The blue/green module routes traffic only after `/ready` succeeds.

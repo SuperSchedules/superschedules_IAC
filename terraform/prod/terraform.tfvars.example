@@ -8,10 +8,38 @@ collector_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-c
 static_bucket_name = "superschedules-prod-static-123456789012"
 
 # Optional overrides
-# aws_region            = "us-east-1"
-# app_instance_type     = "t3.small"
+# aws_region        = "us-east-1"
+# app_instance_type = "t3.small"
+# blue_desired_capacity  = 2
+# blue_min_size          = 1
+# blue_max_size          = 3
+# green_desired_capacity = 0
+# green_min_size         = 0
+# green_max_size         = 3
+# app_launch_template_version = "$Latest"
+# app_health_check_grace_period = 420
+# health_check_path     = "/ready"
+# health_check_interval = 30
+# health_check_timeout  = 5
+# health_check_healthy_threshold   = 3
+# health_check_unhealthy_threshold = 2
+# deregistration_delay  = 180
+# listener_port         = 80
+# listener_protocol     = "HTTP"
+# listener_arn          = null
+# active_color          = "blue"
+# traffic_split = [
+#   { tg = "blue",  weight = 90 },
+#   { tg = "green", weight = 10 }
+# ]
+# enable_instance_protection = true
+# enable_lifecycle_hook      = true
+# lifecycle_default_result   = "ABANDON"
+# lifecycle_heartbeat_timeout = 900
+# default_tags = {
+#   Owner = "platform-team"
+# }
 # django_settings_module = "config.settings.production"
-# health_check_path     = "/"
 
 # Optional DB settings (password is generated if unset)
 # db_engine_version = "15"

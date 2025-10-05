@@ -6,6 +6,7 @@ node_modules
 .terraform/
 *.tfstate
 *.tfstate.*
+.terraform.lock.hcl
 crash.log
 override.tf
 override.tf.json
@@ -13,3 +14,14 @@ override.tf.json
 *_override.tf.json
 terraform.tfvars
 terraform.tfvars.json
+
+# Terraform plan files
+*.tfplan
+tfplan
+
+# Patch files
+*.diff
+*.patch
+
+# Alternative/redundant configs
+envs/

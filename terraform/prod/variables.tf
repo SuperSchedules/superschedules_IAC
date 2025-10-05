@@ -28,6 +28,54 @@ variable "app_instance_type" {
   default     = "t3.small"
 }
 
+variable "blue_desired_capacity" {
+  description = "Desired capacity for the blue Auto Scaling Group"
+  type        = number
+  default     = 1
+}
+
+variable "blue_min_size" {
+  description = "Minimum capacity for the blue Auto Scaling Group"
+  type        = number
+  default     = 1
+}
+
+variable "blue_max_size" {
+  description = "Maximum capacity for the blue Auto Scaling Group"
+  type        = number
+  default     = 2
+}
+
+variable "green_desired_capacity" {
+  description = "Desired capacity for the green Auto Scaling Group"
+  type        = number
+  default     = 0
+}
+
+variable "green_min_size" {
+  description = "Minimum capacity for the green Auto Scaling Group"
+  type        = number
+  default     = 0
+}
+
+variable "green_max_size" {
+  description = "Maximum capacity for the green Auto Scaling Group"
+  type        = number
+  default     = 2
+}
+
+variable "app_launch_template_version" {
+  description = "Launch template version to use for blue/green groups"
+  type        = string
+  default     = "$Latest"
+}
+
+variable "app_health_check_grace_period" {
+  description = "Seconds to ignore unhealthy checks after an instance launches"
+  type        = number
+  default     = 420
+}
+
 variable "nginx_image" {
   description = "ECR image URI:tag for Nginx"
   type        = string
@@ -93,5 +141,135 @@ variable "static_bucket_name" {
 variable "health_check_path" {
   description = "ALB health check path"
   type        = string
-  default     = "/"
+  default     = "/ready"
+}
+
+variable "health_check_interval" {
+  description = "Seconds between ALB health checks"
+  type        = number
+  default     = 30
+}
+
+variable "health_check_timeout" {
+  description = "Timeout in seconds for ALB health checks"
+  type        = number
+  default     = 5
+}
+
+variable "health_check_healthy_threshold" {
+  description = "Consecutive successes before a target is marked healthy"
+  type        = number
+  default     = 3
+}
+
+variable "health_check_unhealthy_threshold" {
+  description = "Consecutive failures before a target is marked unhealthy"
+  type        = number
+  default     = 2
+}
+
+variable "deregistration_delay" {
+  description = "Seconds to wait for in-flight requests before deregistering targets"
+  type        = number
+  default     = 180
+}
+
+variable "listener_port" {
+  description = "Port for the HTTP listener"
+  type        = number
+  default     = 80
+}
+
+variable "listener_protocol" {
+  description = "Protocol for the ALB listener"
+  type        = string
+  default     = "HTTP"
+}
+
+variable "listener_arn" {
+  description = "Existing listener ARN (optional). Leave null to let Terraform manage the listener."
+  type        = string
+  default     = null
+}
+
+variable "active_color" {
+  description = "Color currently serving production traffic"
+  type        = string
+  default     = "blue"
+
+  validation {
+    condition     = contains(["blue", "green"], var.active_color)
+    error_message = "active_color must be either \"blue\" or \"green\"."
+  }
+}
+
+variable "traffic_split" {
+  description = "Weighted blue/green traffic split"
+  type = list(object({
+    tg     = string
+    weight = number
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for entry in var.traffic_split : contains(["blue", "green"], entry.tg)
+    ])
+    error_message = "traffic_split entries must reference the blue or green target group."
+  }
+
+  validation {
+    condition = length(var.traffic_split) == 0 || sum([
+      for entry in var.traffic_split : entry.weight
+    ]) == 100
+    error_message = "traffic_split weights must sum to 100."
+  }
+}
+
+variable "enable_instance_protection" {
+  description = "Enable instance protection from scale-in during cutovers"
+  type        = bool
+  default     = false
+}
+
+variable "enable_lifecycle_hook" {
+  description = "Create the lifecycle hook that pauses instances until setup completes"
+  type        = bool
+  default     = true
+}
+
+variable "lifecycle_default_result" {
+  description = "Lifecycle hook default result when the heartbeat times out"
+  type        = string
+  default     = "ABANDON"
+}
+
+variable "lifecycle_heartbeat_timeout" {
+  description = "Seconds before the lifecycle hook times out"
+  type        = number
+  default     = 900
+}
+
+variable "lifecycle_notification_metadata" {
+  description = "Optional metadata blob for lifecycle hook notifications"
+  type        = string
+  default     = null
+}
+
+variable "lifecycle_notification_target_arn" {
+  description = "Optional SNS or SQS ARN for lifecycle notifications"
+  type        = string
+  default     = null
+}
+
+variable "lifecycle_notification_role_arn" {
+  description = "IAM role ARN allowing lifecycle notifications"
+  type        = string
+  default     = null
+}
+
+variable "default_tags" {
+  description = "Tags merged into all module-managed resources"
+  type        = map(string)
+  default     = {}
 }

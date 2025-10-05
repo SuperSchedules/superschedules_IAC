@@ -48,6 +48,8 @@ services:
       - DEBUG=False
       - LLM_PROVIDER=bedrock
       - AWS_BEDROCK_REGION=${region}
+      - COLLECTOR_URL=http://collector:8001
+      - NAVIGATOR_URL=http://navigator:8004
     depends_on:
       - wait-for-db
   # collector:

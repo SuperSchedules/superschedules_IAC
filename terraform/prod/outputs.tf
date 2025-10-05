@@ -12,3 +12,28 @@ output "static_bucket" {
   description = "S3 static bucket name"
   value       = aws_s3_bucket.static.bucket
 }
+
+output "bluegreen_target_groups" {
+  description = "Target group ARNs for the blue and green environments"
+  value       = module.service_bluegreen.target_group_arns
+}
+
+output "bluegreen_autoscaling_groups" {
+  description = "Auto Scaling Group names for blue and green"
+  value       = module.service_bluegreen.autoscaling_group_names
+}
+
+output "bluegreen_active_color" {
+  description = "Color currently receiving primary traffic"
+  value       = module.service_bluegreen.active_color
+}
+
+output "bluegreen_ready_to_flip" {
+  description = "Indicates whether the standby color is healthy and ready for a flip"
+  value       = module.service_bluegreen.ready_to_flip
+}
+
+output "bluegreen_readiness" {
+  description = "Per-color readiness map"
+  value       = module.service_bluegreen.readiness_by_color
+}

@@ -41,25 +41,3 @@ resource "aws_launch_template" "app" {
   }
 }
 
-resource "aws_autoscaling_group" "app" {
-  name                      = "superschedules-prod-asg"
-  desired_capacity          = 1
-  max_size                  = 1
-  min_size                  = 1
-  vpc_zone_identifier       = [for s in aws_subnet.private : s.id]
-  target_group_arns         = [aws_lb_target_group.app.arn]
-  health_check_type         = "EC2"
-  health_check_grace_period = 120
-
-  launch_template {
-    id      = aws_launch_template.app.id
-    version = "$Latest"
-  }
-
-  tag {
-    key                 = "Name"
-    value               = "superschedules-prod-app"
-    propagate_at_launch = true
-  }
-}
-
