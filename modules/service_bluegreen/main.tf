@@ -1,9 +1,21 @@
 locals {
   colors = ["blue", "green"]
 
-  target_group_names = {
-    for color in local.colors :
-    color => format("%s-%s-tg-%s", var.service, var.environment, color)
+  # Create a flat map of all target group combinations (color + tg_name)
+  all_target_groups = flatten([
+    for color in local.colors : [
+      for tg_name, tg_config in var.target_groups : {
+        key       = "${color}-${tg_name}"
+        color     = color
+        tg_name   = tg_name
+        tg_config = tg_config
+      }
+    ]
+  ])
+
+  target_groups_map = {
+    for tg in local.all_target_groups :
+    tg.key => tg
   }
 
   autoscaling_group_names = {
@@ -19,17 +31,6 @@ locals {
     var.tags
   )
 
-  target_group_tags = {
-    for color in local.colors :
-    color => merge(
-      local.base_tags,
-      {
-        Name  = local.target_group_names[color]
-        Color = color
-      }
-    )
-  }
-
   autoscaling_tags = {
     for color in local.colors :
     color => merge(
@@ -43,26 +44,34 @@ locals {
 }
 
 resource "aws_lb_target_group" "this" {
-  for_each = toset(local.colors)
+  for_each = local.target_groups_map
 
-  name                 = local.target_group_names[each.key]
-  port                 = var.target_group_port
-  protocol             = var.target_group_protocol
+  # Use shorter name format to stay under 32 char limit
+  name                 = format("%s-%s-%s-%s", substr(var.service, 0, 10), var.environment, each.value.tg_name, each.value.color)
+  port                 = each.value.tg_config.port
+  protocol             = each.value.tg_config.protocol
   target_type          = var.target_type
   vpc_id               = var.vpc_id
-  deregistration_delay = var.deregistration_delay
+  deregistration_delay = each.value.tg_config.deregistration_delay
 
   health_check {
     enabled             = true
-    path                = var.health_check_path
-    matcher             = var.health_check_matcher
+    path                = each.value.tg_config.health_check_path
+    matcher             = each.value.tg_config.health_check_matcher
     interval            = var.health_check_interval
     healthy_threshold   = var.health_check_healthy_threshold
     unhealthy_threshold = var.health_check_unhealthy_threshold
     timeout             = var.health_check_timeout
   }
 
-  tags = local.target_group_tags[each.key]
+  tags = merge(
+    local.base_tags,
+    {
+      Name  = format("%s-%s-%s-%s", var.service, var.environment, each.value.tg_name, each.value.color)
+      Color = each.value.color
+      TargetGroup = each.value.tg_name
+    }
+  )
 }
 
 resource "aws_autoscaling_group" "this" {
@@ -86,7 +95,11 @@ resource "aws_autoscaling_group" "this" {
   force_delete          = var.force_delete_asg
   protect_from_scale_in = var.enable_instance_protection
 
-  target_group_arns = [aws_lb_target_group.this[each.key].arn]
+  # Attach all target groups for this color
+  target_group_arns = [
+    for tg_key, tg in aws_lb_target_group.this :
+    tg.arn if local.target_groups_map[tg_key].color == each.key
+  ]
 
   launch_template {
     id      = var.launch_template_id
@@ -122,22 +135,30 @@ resource "aws_autoscaling_lifecycle_hook" "launching" {
 }
 
 locals {
-  listener_target_groups = {
+  active_color  = var.active_color
+  standby_color = local.active_color == "blue" ? "green" : "blue"
+
+  # Find the default target group (one with no path_patterns) for each color
+  default_tg_key = [
+    for tg_name, tg_config in var.target_groups :
+    tg_name if length(tg_config.path_patterns) == 0
+  ][0]
+
+  # Get ARNs for default target groups by color
+  default_target_groups = {
     for color in local.colors :
-    color => aws_lb_target_group.this[color].arn
+    color => aws_lb_target_group.this["${color}-${local.default_tg_key}"].arn
   }
 
+  # Build traffic split for default target groups
   traffic_split_resolved = length(var.traffic_split) == 0 ? [] : [
     for entry in var.traffic_split :
     {
       color  = entry.tg
-      arn    = local.listener_target_groups[entry.tg]
+      arn    = local.default_target_groups[entry.tg]
       weight = entry.weight
     }
   ]
-
-  active_color  = var.active_color
-  standby_color = local.active_color == "blue" ? "green" : "blue"
 
   listener_mode = var.listener_fixed_response != null ? "fixed" : (
     var.listener_redirect != null ? "redirect" : (
@@ -146,6 +167,20 @@ locals {
   )
 
   listener_arn = var.listener_arn == null ? aws_lb_listener.this[0].arn : var.listener_arn
+
+  # Build listener rules for target groups with path patterns
+  listener_rules = flatten([
+    for tg_name, tg_config in var.target_groups : [
+      for color in local.colors : {
+        key              = "${color}-${tg_name}"
+        tg_arn           = aws_lb_target_group.this["${color}-${tg_name}"].arn
+        path_patterns    = tg_config.path_patterns
+        priority         = tg_config.listener_rule_priority
+        color            = color
+        tg_name          = tg_name
+      }
+    ] if length(tg_config.path_patterns) > 0
+  ])
 }
 
 resource "aws_lb_listener" "this" {
@@ -158,7 +193,7 @@ resource "aws_lb_listener" "this" {
     for_each = local.listener_mode == "forward" ? [true] : []
     content {
       type             = "forward"
-      target_group_arn = local.listener_target_groups[local.active_color]
+      target_group_arn = local.default_target_groups[local.active_color]
     }
   }
 
@@ -229,7 +264,7 @@ resource "aws_lb_listener_rule" "weights" {
       dynamic "target_group" {
         for_each = length(local.traffic_split_resolved) == 0 ? [
           {
-            arn    = local.listener_target_groups[local.active_color]
+            arn    = local.default_target_groups[local.active_color]
             weight = 1
           }
         ] : local.traffic_split_resolved
@@ -253,23 +288,37 @@ resource "aws_lb_listener_rule" "weights" {
   }
 }
 
-locals {
-  readiness_by_color = {
-    for color, asg in aws_autoscaling_group.this :
-    color => (
-      length(asg.instances) > 0 &&
-      alltrue([
-        for inst in asg.instances :
-        inst.health_status == "Healthy" && contains(["InService"], inst.lifecycle_state)
-      ]) &&
-      (asg.desired_capacity == null || length(asg.instances) >= asg.desired_capacity)
-    )
+# Path-based routing rules for non-default target groups
+resource "aws_lb_listener_rule" "path_routes" {
+  for_each = {
+    for rule in local.listener_rules :
+    rule.key => rule if rule.color == local.active_color
   }
 
-  ready_to_flip = lookup(local.readiness_by_color, local.standby_color, false)
+  listener_arn = local.listener_arn
+  priority     = each.value.priority
 
-  active_target_group_arn = local.listener_target_groups[local.active_color]
-  active_target_group_name = local.target_group_names[local.active_color]
+  action {
+    type             = "forward"
+    target_group_arn = each.value.tg_arn
+  }
+
+  condition {
+    path_pattern {
+      values = each.value.path_patterns
+    }
+  }
+
+  lifecycle {
+    # Delete old rules before creating new ones to avoid priority conflicts during color flips
+    create_before_destroy = false
+  }
+}
+
+locals {
+  # Note: Instance readiness cannot be determined during plan time
+  # Use external monitoring or CI/CD checks to verify deployment readiness
+  ready_to_flip = false
 
   traffic_split_effective = length(local.traffic_split_resolved) == 0 ? [
     {
