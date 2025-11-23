@@ -59,6 +59,16 @@ class DeploymentManager:
             else:
                 return "unknown"
 
+    def get_active_capacity(self) -> int:
+        """Get the desired capacity of the currently active environment."""
+        active_env = self.get_active_environment()
+        asg_name = self.config.blue_asg if active_env == "blue" else self.config.green_asg
+
+        asg_info = self.aws.get_asg_info(asg_name)
+        if asg_info:
+            return asg_info["DesiredCapacity"]
+        return 1  # Default fallback
+
     def show_status(self):
         """Display comprehensive deployment status."""
         active_env = self.get_active_environment()
@@ -381,6 +391,7 @@ class DeploymentManager:
     def flip_traffic(self, target_env: Optional[str] = None):
         """Flip traffic to specified environment or auto-detect inactive."""
         active_env = self.get_active_environment()
+        active_capacity = self.get_active_capacity()
 
         if target_env is None:
             target_env = "green" if active_env == "blue" else "blue"
@@ -395,9 +406,10 @@ class DeploymentManager:
         try:
             # Determine the correct make target based on target environment
             if target_env == "green":
+                # Flip to green - preserve green's capacity (which will become active)
                 cmd = "make deploy:flip"
             else:
-                # Flip back to blue (rollback)
+                # Flip back to blue (rollback) - preserve blue's capacity (which will become active)
                 cmd = "make deploy:rollback"
 
             console.print(f"\n[dim]Running: {cmd}[/dim]\n")

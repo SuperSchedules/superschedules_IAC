@@ -274,9 +274,11 @@ class InteractiveDashboard:
         if action_key == "scale_down":
             active_env = self.manager.get_active_environment()
             inactive_env = "green" if active_env == "blue" else "blue"
+            active_capacity = self.manager.get_active_capacity()
 
             console.clear()
             console.print(f"[bold yellow]Scale down {inactive_env.upper()} environment?[/bold yellow]\n")
+            console.print(f"[dim]Will scale {inactive_env} to 0 and preserve {active_env}'s capacity at {active_capacity}[/dim]\n")
 
             if not click.confirm(f"This will set {inactive_env} to 0 instances", default=True):
                 self.set_message("Scale down cancelled", "info")
@@ -284,10 +286,11 @@ class InteractiveDashboard:
 
             try:
                 import subprocess
-                cmd = f"make deploy:scale-down-{inactive_env}"
+                cmd = f"make deploy:scale-down-{inactive_env} ACTIVE_DESIRED_CAPACITY={active_capacity}"
                 result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
                 console.print(result.stdout)
                 console.print(f"\n[green]✓ {inactive_env.upper()} scaled down successfully![/green]")
+                console.print(f"[green]✓ {active_env.upper()} capacity preserved at {active_capacity}[/green]")
                 console.print("\nPress any key to return to dashboard...")
                 input()
                 self.set_message(f"{inactive_env.upper()} scaled down", "success")
