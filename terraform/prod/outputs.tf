@@ -28,6 +28,11 @@ output "bluegreen_active_color" {
   value       = module.service_bluegreen.active_color
 }
 
+output "active_color" {
+  description = "Alias for bluegreen_active_color (used by Makefile)"
+  value       = module.service_bluegreen.active_color
+}
+
 output "bluegreen_ready_to_flip" {
   description = "Indicates whether the standby color is healthy and ready for a flip"
   value       = module.service_bluegreen.ready_to_flip

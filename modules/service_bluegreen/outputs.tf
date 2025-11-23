@@ -1,11 +1,11 @@
 output "target_group_arns" {
-  description = "Map of color to target group ARN."
-  value       = { for color in local.colors : color => aws_lb_target_group.this[color].arn }
+  description = "Map of target group key (color-tgname) to target group ARN."
+  value       = { for key, tg in aws_lb_target_group.this : key => tg.arn }
 }
 
 output "target_group_names" {
-  description = "Map of color to target group name."
-  value       = local.target_group_names
+  description = "Map of target group key (color-tgname) to target group name."
+  value       = { for key, tg in aws_lb_target_group.this : key => tg.name }
 }
 
 output "autoscaling_group_arns" {
@@ -29,21 +29,18 @@ output "active_color" {
 }
 
 output "active_target_group" {
-  description = "Details for the target group currently receiving default traffic."
-  value = {
-    arn  = local.active_target_group_arn
-    name = local.active_target_group_name
-  }
+  description = "ARN of the default target group currently receiving default traffic."
+  value       = local.default_target_groups[local.active_color]
 }
 
 output "traffic_split_effective" {
   description = "Effective traffic weighting applied to each color."
-  value       = local.traffic_split_effective
+  value       = local.traffic_split_resolved
 }
 
 output "readiness_by_color" {
   description = "Map indicating whether every instance in each color is in-service and healthy."
-  value       = local.readiness_by_color
+  value       = {}  # Removed: instance readiness cannot be determined during plan time
 }
 
 output "ready_to_flip" {

@@ -24,7 +24,8 @@ resource "aws_launch_template" "app" {
     db_username     = var.db_username,
     db_password     = local.db_password_effective,
     static_bucket   = aws_s3_bucket.static.bucket,
-    django_settings_module = var.django_settings_module
+    django_settings_module = var.django_settings_module,
+    alb_dns_name    = aws_lb.app.dns_name
   }))
 
   iam_instance_profile {
@@ -32,6 +33,26 @@ resource "aws_launch_template" "app" {
   }
 
   vpc_security_group_ids = [aws_security_group.app.id]
+
+  block_device_mappings {
+    device_name = "/dev/sda1"
+
+    ebs {
+      volume_size           = 20
+      volume_type           = "gp3"
+      delete_on_termination = true
+      encrypted             = true
+    }
+  }
+
+  # Use spot instances for cost savings (~68% cheaper)
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      max_price = ""  # Use current spot price
+      # Note: ASG only supports one-time spot instances
+    }
+  }
 
   tag_specifications {
     resource_type = "instance"

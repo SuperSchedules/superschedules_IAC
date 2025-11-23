@@ -25,7 +25,7 @@ variable "private_subnet_cidrs" {
 variable "app_instance_type" {
   description = "EC2 instance type for app"
   type        = string
-  default     = "t3.small"
+  default     = "t3.micro"
 }
 
 variable "blue_desired_capacity" {
@@ -241,13 +241,13 @@ variable "enable_lifecycle_hook" {
 variable "lifecycle_default_result" {
   description = "Lifecycle hook default result when the heartbeat times out"
   type        = string
-  default     = "ABANDON"
+  default     = "CONTINUE"
 }
 
 variable "lifecycle_heartbeat_timeout" {
   description = "Seconds before the lifecycle hook times out"
   type        = number
-  default     = 900
+  default     = 300  # 5 minutes - enough time for instance to boot and pass health checks
 }
 
 variable "lifecycle_notification_metadata" {

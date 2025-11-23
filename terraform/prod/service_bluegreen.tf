@@ -11,6 +11,27 @@ module "service_bluegreen" {
   launch_template_id      = aws_launch_template.app.id
   launch_template_version = var.app_launch_template_version
 
+  # Define multiple target groups per color
+  target_groups = {
+    frontend = {
+      port                   = 80
+      protocol               = "HTTP"
+      health_check_path      = "/"
+      health_check_matcher   = "200-399"
+      deregistration_delay   = var.deregistration_delay
+      path_patterns          = []  # Default target group (no path patterns)
+    }
+    django = {
+      port                   = 8000
+      protocol               = "HTTP"
+      health_check_path      = "/api/live"
+      health_check_matcher   = "200-399"
+      deregistration_delay   = var.deregistration_delay
+      path_patterns          = ["/admin/*", "/api/*", "/chat/*", "/static/*"]
+      listener_rule_priority = 100
+    }
+  }
+
   desired_capacity_blue  = var.blue_desired_capacity
   desired_capacity_green = var.green_desired_capacity
   min_size_blue          = var.blue_min_size
@@ -18,13 +39,11 @@ module "service_bluegreen" {
   max_size_blue          = var.blue_max_size
   max_size_green         = var.green_max_size
 
-  health_check_grace_period = var.app_health_check_grace_period
-  health_check_path          = var.health_check_path
-  health_check_interval      = var.health_check_interval
-  health_check_timeout       = var.health_check_timeout
+  health_check_grace_period        = var.app_health_check_grace_period
+  health_check_interval            = var.health_check_interval
+  health_check_timeout             = var.health_check_timeout
   health_check_healthy_threshold   = var.health_check_healthy_threshold
   health_check_unhealthy_threshold = var.health_check_unhealthy_threshold
-  deregistration_delay             = var.deregistration_delay
 
   listener_port     = var.listener_port
   listener_protocol = var.listener_protocol

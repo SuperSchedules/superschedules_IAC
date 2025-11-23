@@ -135,16 +135,17 @@ variable "health_check_grace_period" {
   default     = 420
 }
 
-variable "target_group_port" {
-  type        = number
-  description = "Port used by both target groups."
-  default     = 80
-}
-
-variable "target_group_protocol" {
-  type        = string
-  description = "Protocol used by both target groups."
-  default     = "HTTP"
+variable "target_groups" {
+  type = map(object({
+    port                     = number
+    protocol                 = string
+    health_check_path        = string
+    health_check_matcher     = optional(string, "200-399")
+    deregistration_delay     = optional(number, 180)
+    path_patterns            = optional(list(string), [])  # Empty means default action
+    listener_rule_priority   = optional(number, null)      # Required if path_patterns is set
+  }))
+  description = "Map of target group configurations. Key is the target group name suffix (e.g., 'frontend', 'django')"
 }
 
 variable "target_type" {
@@ -155,7 +156,7 @@ variable "target_type" {
 
 variable "health_check_path" {
   type        = string
-  description = "Health check path that reflects full readiness (e.g., /ready)."
+  description = "DEPRECATED: Use target_groups[].health_check_path instead. Health check path that reflects full readiness (e.g., /ready)."
   default     = "/ready"
 }
 
