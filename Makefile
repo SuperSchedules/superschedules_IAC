@@ -147,7 +147,8 @@ deploy\:scale-down-blue:
 		-var "blue_max_size=2" \
 		-var "green_desired_capacity=$(ACTIVE_DESIRED_CAPACITY)" \
 		-var "green_min_size=$(ACTIVE_MIN_SIZE)" \
-		-var "green_max_size=$(ACTIVE_MAX_SIZE)"
+		-var "green_max_size=$(ACTIVE_MAX_SIZE)" \
+		-var "active_color=green"
 
 deploy\:scale-down-green:
 	@echo "Scaling down green environment to 0 instances..."
@@ -164,4 +165,5 @@ deploy\:scale-down-green:
 		-var "green_max_size=2" \
 		-var "blue_desired_capacity=$(ACTIVE_DESIRED_CAPACITY)" \
 		-var "blue_min_size=$(ACTIVE_MIN_SIZE)" \
-		-var "blue_max_size=$(ACTIVE_MAX_SIZE)"
+		-var "blue_max_size=$(ACTIVE_MAX_SIZE)" \
+		-var "active_color=blue"
