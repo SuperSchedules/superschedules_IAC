@@ -8,6 +8,9 @@ GREEN_CAPACITY   ?= 1
 GREEN_MIN_SIZE   ?= 1
 GREEN_MAX_SIZE   ?= 2
 BLUE_RETIRE_CAPACITY ?= 0
+ACTIVE_DESIRED_CAPACITY ?= 1
+ACTIVE_MIN_SIZE ?= 1
+ACTIVE_MAX_SIZE ?= 2
 DRAIN_WAIT ?= 180
 
 dev-ec2:
@@ -65,8 +68,18 @@ deploy\:canary-50:
   -var "active_color=blue"
 
 deploy\:flip:
+	@echo "WARNING: This will switch production traffic to GREEN!"
+	@read -p "Are you sure you want to flip traffic to GREEN? [y/N]: " confirm; \
+	if [ "$$confirm" != "y" ]; then \
+		echo "Flip cancelled."; \
+		exit 1; \
+	fi
+	@echo "Running: make deploy:flip"
 	terraform -chdir=terraform/prod init
 	terraform -chdir=terraform/prod apply -auto-approve \
+  -var "blue_desired_capacity=$(BLUE_RETIRE_CAPACITY)" \
+  -var "blue_min_size=$(BLUE_RETIRE_CAPACITY)" \
+  -var "blue_max_size=2" \
   -var "green_desired_capacity=$(GREEN_CAPACITY)" \
   -var "green_min_size=$(GREEN_MIN_SIZE)" \
   -var "green_max_size=$(GREEN_MAX_SIZE)" \
@@ -84,8 +97,20 @@ deploy\:retire-blue:
   -var "active_color=green"
 
 deploy\:rollback:
+	@echo "WARNING: This will rollback production traffic to BLUE!"
+	@read -p "Are you sure you want to rollback to BLUE? [y/N]: " confirm; \
+	if [ "$$confirm" != "y" ]; then \
+		echo "Rollback cancelled."; \
+		exit 1; \
+	fi
+	@echo "Running: make deploy:rollback"
 	terraform -chdir=terraform/prod init
 	terraform -chdir=terraform/prod apply -auto-approve \
+  -var "blue_desired_capacity=$(GREEN_CAPACITY)" \
+  -var "blue_min_size=$(GREEN_MIN_SIZE)" \
+  -var "blue_max_size=$(GREEN_MAX_SIZE)" \
+  -var "green_desired_capacity=0" \
+  -var "green_min_size=0" \
   -var "traffic_split=[]" \
   -var "active_color=blue"
 
@@ -114,14 +139,15 @@ deploy\:scale-down-blue:
 		echo "⚠️  ERROR: Blue is currently ACTIVE! Cannot scale down the active environment."; \
 		exit 1; \
 	fi
+	@echo "Preserving green's current capacity (ACTIVE_DESIRED_CAPACITY=$(ACTIVE_DESIRED_CAPACITY))"
 	terraform -chdir=terraform/prod init
 	terraform -chdir=terraform/prod apply -auto-approve \
 		-var "blue_desired_capacity=0" \
 		-var "blue_min_size=0" \
 		-var "blue_max_size=2" \
-		-var "green_desired_capacity=$(GREEN_CAPACITY)" \
-		-var "green_min_size=$(GREEN_MIN_SIZE)" \
-		-var "green_max_size=$(GREEN_MAX_SIZE)"
+		-var "green_desired_capacity=$(ACTIVE_DESIRED_CAPACITY)" \
+		-var "green_min_size=$(ACTIVE_MIN_SIZE)" \
+		-var "green_max_size=$(ACTIVE_MAX_SIZE)"
 
 deploy\:scale-down-green:
 	@echo "Scaling down green environment to 0 instances..."
@@ -130,11 +156,12 @@ deploy\:scale-down-green:
 		echo "⚠️  ERROR: Green is currently ACTIVE! Cannot scale down the active environment."; \
 		exit 1; \
 	fi
+	@echo "Preserving blue's current capacity (ACTIVE_DESIRED_CAPACITY=$(ACTIVE_DESIRED_CAPACITY))"
 	terraform -chdir=terraform/prod init
 	terraform -chdir=terraform/prod apply -auto-approve \
 		-var "green_desired_capacity=0" \
 		-var "green_min_size=0" \
 		-var "green_max_size=2" \
-		-var "blue_desired_capacity=1" \
-		-var "blue_min_size=1" \
-		-var "blue_max_size=2"
+		-var "blue_desired_capacity=$(ACTIVE_DESIRED_CAPACITY)" \
+		-var "blue_min_size=$(ACTIVE_MIN_SIZE)" \
+		-var "blue_max_size=$(ACTIVE_MAX_SIZE)"
