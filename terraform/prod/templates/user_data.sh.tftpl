@@ -5,6 +5,18 @@ REGION=${region}
 APP_DIR=/opt/superschedules
 mkdir -p "$APP_DIR"
 
+# Create swap file (2GB for t3.micro with 1GB RAM)
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  # Set swappiness to 10 (prefer RAM, use swap as backup)
+  sysctl vm.swappiness=10
+  echo 'vm.swappiness=10' >> /etc/sysctl.conf
+fi
+
 # Install Docker and compose plugin
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
@@ -52,16 +64,16 @@ services:
       - NAVIGATOR_URL=http://navigator:8004
     depends_on:
       - wait-for-db
-  # collector:
-  #   image: ${collector_image}
-  #   ports:
-  #     - "8001:8001"
-  #   environment:
-  #     - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
-  #     - AWS_REGION=${region}
-  #     - AWS_S3_BUCKET=${static_bucket}
-  #   depends_on:
-  #     - wait-for-db
+  collector:
+    image: ${collector_image}
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
+      - AWS_REGION=${region}
+      - AWS_S3_BUCKET=${static_bucket}
+    depends_on:
+      - wait-for-db
   navigator:
     image: ${fastapi_image}
     ports:
@@ -92,7 +104,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/superschedules
 ExecStartPre=/bin/bash -c 'aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${aws_account_id}.dkr.ecr.${region}.amazonaws.com'
-ExecStart=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml up -d
+ExecStart=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml up -d --pull always
 ExecStop=/usr/bin/docker compose -f /opt/superschedules/docker-compose.yml down
 TimeoutStartSec=0
 Restart=on-failure
