@@ -143,19 +143,19 @@ variable "health_check_path" {
 variable "health_check_interval" {
   description = "Seconds between ALB health checks"
   type        = number
-  default     = 30
+  default     = 20  # Faster checks to bring instances up quicker
 }
 
 variable "health_check_timeout" {
   description = "Timeout in seconds for ALB health checks"
   type        = number
-  default     = 5
+  default     = 10  # Longer timeout to account for Django startup
 }
 
 variable "health_check_healthy_threshold" {
   description = "Consecutive successes before a target is marked healthy"
   type        = number
-  default     = 3
+  default     = 2  # Reduced from 3 to speed up healthy marking
 }
 
 variable "health_check_unhealthy_threshold" {
