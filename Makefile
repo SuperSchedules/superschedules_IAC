@@ -50,6 +50,9 @@ deploy\:new-green:
   -var "green_desired_capacity=$(GREEN_CAPACITY)" \
   -var "green_min_size=$(GREEN_MIN_SIZE)" \
   -var "green_max_size=$(GREEN_MAX_SIZE)" \
+  -var "blue_desired_capacity=$(ACTIVE_DESIRED_CAPACITY)" \
+  -var "blue_min_size=$(ACTIVE_MIN_SIZE)" \
+  -var "blue_max_size=$(ACTIVE_MAX_SIZE)" \
   -var "traffic_split=[]" \
   -var "active_color=blue"
 
@@ -75,6 +78,9 @@ deploy\:new-blue:
   -var "blue_desired_capacity=$(BLUE_CAPACITY)" \
   -var "blue_min_size=$(BLUE_MIN_SIZE)" \
   -var "blue_max_size=$(BLUE_MAX_SIZE)" \
+  -var "green_desired_capacity=$(ACTIVE_DESIRED_CAPACITY)" \
+  -var "green_min_size=$(ACTIVE_MIN_SIZE)" \
+  -var "green_max_size=$(ACTIVE_MAX_SIZE)" \
   -var "traffic_split=[]" \
   -var "active_color=green"
 

@@ -256,9 +256,27 @@ class DeploymentManager:
         console.print(f"\n[bold cyan]Starting deployment to {target_env}...[/bold cyan]\n")
 
         try:
-            # Run make deploy command
-            cmd = f"make deploy:new-{target_env}"
+            # Get active environment's current capacity to preserve it
+            active_asg = self.config.blue_asg if active_env == "blue" else self.config.green_asg
+            active_asg_info = self.aws.get_asg_info(active_asg)
+
+            if active_asg_info:
+                active_capacity = active_asg_info["DesiredCapacity"]
+                active_min = active_asg_info["MinSize"]
+                active_max = active_asg_info["MaxSize"]
+            else:
+                # Fallback to defaults if we can't get ASG info
+                active_capacity = 1
+                active_min = 1
+                active_max = 2
+
+            # Run make deploy command with active environment capacity preserved
+            cmd = (f"make deploy:new-{target_env} "
+                   f"ACTIVE_DESIRED_CAPACITY={active_capacity} "
+                   f"ACTIVE_MIN_SIZE={active_min} "
+                   f"ACTIVE_MAX_SIZE={active_max}")
             console.print(f"[dim]Running: {cmd}[/dim]\n")
+            console.print(f"[dim]Preserving {active_env} capacity: {active_capacity} instances[/dim]\n")
 
             process = subprocess.Popen(
                 cmd,
@@ -407,10 +425,12 @@ class DeploymentManager:
             # Determine the correct make target based on target environment
             if target_env == "green":
                 # Flip to green - preserve green's capacity (which will become active)
-                cmd = "make deploy:flip"
+                # Echo 'y' to auto-confirm Makefile prompt (we already confirmed above)
+                cmd = "echo 'y' | make deploy:flip"
             else:
                 # Flip back to blue (rollback) - preserve blue's capacity (which will become active)
-                cmd = "make deploy:rollback"
+                # Echo 'y' to auto-confirm Makefile prompt (we already confirmed above)
+                cmd = "echo 'y' | make deploy:rollback"
 
             console.print(f"\n[dim]Running: {cmd}[/dim]\n")
 

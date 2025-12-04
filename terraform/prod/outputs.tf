@@ -42,3 +42,13 @@ output "bluegreen_readiness" {
   description = "Per-color readiness map"
   value       = module.service_bluegreen.readiness_by_color
 }
+
+output "ecr_repositories" {
+  description = "ECR repository URIs for all services"
+  value = {
+    frontend  = aws_ecr_repository.frontend.repository_url
+    api       = aws_ecr_repository.api.repository_url
+    navigator = aws_ecr_repository.navigator.repository_url
+    collector = aws_ecr_repository.collector.repository_url
+  }
+}

@@ -1,0 +1,58 @@
+name: Terraform Prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply changes (true to apply, false to plan only)"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-prod.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TF }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform Init
+        run: terraform -chdir=terraform/prod init -input=false
+
+      - name: Terraform Validate
+        run: terraform -chdir=terraform/prod validate
+
+      - name: Terraform Plan
+        run: terraform -chdir=terraform/prod plan -input=false -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event_name == 'workflow_dispatch' && inputs.apply == 'true'
+        run: terraform -chdir=terraform/prod apply -input=false -auto-approve tfplan
+

@@ -28,16 +28,7 @@ resource "aws_subnet" "public" {
   }
 }
 
-resource "aws_subnet" "private" {
-  for_each          = { for idx, cidr in var.private_subnet_cidrs : idx => cidr }
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = each.value
-  availability_zone = element(data.aws_availability_zones.available.names, tonumber(each.key))
-
-  tags = {
-    Name = "superschedules-prod-private-${each.key}"
-  }
-}
+# Private subnets removed - using public subnets only to eliminate NAT Gateway costs
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -62,35 +53,6 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-resource "aws_eip" "nat" {
-  domain = "vpc"
-}
-
-resource "aws_nat_gateway" "nat" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = values(aws_subnet.public)[0].id
-
-  tags = {
-    Name = "superschedules-prod-nat"
-  }
-}
-
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.nat.id
-  }
-
-  tags = {
-    Name = "superschedules-prod-private"
-  }
-}
-
-resource "aws_route_table_association" "private" {
-  for_each       = aws_subnet.private
-  subnet_id      = each.value.id
-  route_table_id = aws_route_table.private.id
-}
+# NAT Gateway, Elastic IP, and private route tables removed to save ~$45/month
+# Instances now use public subnets with security groups for protection
 

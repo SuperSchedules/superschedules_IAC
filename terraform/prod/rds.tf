@@ -9,7 +9,9 @@ locals {
 
 resource "aws_db_subnet_group" "db" {
   name       = "superschedules-prod-db-subnets"
-  subnet_ids = [for s in aws_subnet.private : s.id]
+  # RDS remains in existing private subnet (no cost impact, just grandfathered infrastructure)
+  # Note: subnet-0a347f5a226038f4d still exists in AWS but removed from terraform state
+  subnet_ids = ["subnet-0a347f5a226038f4d", "subnet-080be4b7478a56835"]
 
   tags = {
     Name = "superschedules-prod-db-subnets"
