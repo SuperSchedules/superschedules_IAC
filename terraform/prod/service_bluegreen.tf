@@ -7,7 +7,7 @@ module "service_bluegreen" {
   alb_arn = aws_lb.app.arn
   vpc_id  = aws_vpc.main.id
 
-  private_subnet_ids      = [for s in aws_subnet.private : s.id]
+  private_subnet_ids      = [for s in aws_subnet.public : s.id]  # Using public subnets (parameter name kept for module compatibility)
   launch_template_id      = aws_launch_template.app.id
   launch_template_version = var.app_launch_template_version
 
@@ -28,7 +28,7 @@ module "service_bluegreen" {
       health_check_matcher   = "200-399"
       deregistration_delay   = var.deregistration_delay
       path_patterns          = ["/admin/*", "/api/*", "/chat/*", "/static/*"]
-      listener_rule_priority = 100
+      listener_rule_priority = 8
     }
   }
 
@@ -45,9 +45,10 @@ module "service_bluegreen" {
   health_check_healthy_threshold   = var.health_check_healthy_threshold
   health_check_unhealthy_threshold = var.health_check_unhealthy_threshold
 
-  listener_port     = var.listener_port
-  listener_protocol = var.listener_protocol
-  listener_arn      = var.listener_arn
+  # Use HTTPS listener (port 443) for blue/green routing
+  listener_port     = 443
+  listener_protocol = "HTTPS"
+  listener_arn      = aws_lb_listener.https.arn
 
   active_color               = var.active_color
   traffic_split              = var.traffic_split
