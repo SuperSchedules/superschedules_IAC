@@ -167,20 +167,6 @@ locals {
   )
 
   listener_arn = var.listener_arn == null ? aws_lb_listener.this[0].arn : var.listener_arn
-
-  # Build listener rules for target groups with path patterns
-  listener_rules = flatten([
-    for tg_name, tg_config in var.target_groups : [
-      for color in local.colors : {
-        key              = "${color}-${tg_name}"
-        tg_arn           = aws_lb_target_group.this["${color}-${tg_name}"].arn
-        path_patterns    = tg_config.path_patterns
-        priority         = tg_config.listener_rule_priority
-        color            = color
-        tg_name          = tg_name
-      }
-    ] if length(tg_config.path_patterns) > 0
-  ])
 }
 
 resource "aws_lb_listener" "this" {
@@ -289,18 +275,21 @@ resource "aws_lb_listener_rule" "weights" {
 }
 
 # Path-based routing rules for non-default target groups
+# Uses stable resource keys (e.g., "django") and dynamically references active color's target group
+# This allows in-place updates during blue-green flips instead of destroy+create
 resource "aws_lb_listener_rule" "path_routes" {
   for_each = {
-    for rule in local.listener_rules :
-    rule.key => rule if rule.color == local.active_color
+    for tg_name, tg_config in var.target_groups :
+    tg_name => tg_config if length(tg_config.path_patterns) > 0
   }
 
   listener_arn = local.listener_arn
-  priority     = each.value.priority
+  priority     = each.value.listener_rule_priority
 
   action {
     type             = "forward"
-    target_group_arn = each.value.tg_arn
+    # Dynamic reference to active color's target group - updates in-place when active_color changes
+    target_group_arn = aws_lb_target_group.this["${local.active_color}-${each.key}"].arn
   }
 
   condition {
@@ -309,10 +298,12 @@ resource "aws_lb_listener_rule" "path_routes" {
     }
   }
 
-  lifecycle {
-    # Delete old rules before creating new ones to avoid priority conflicts during color flips
-    create_before_destroy = false
-  }
+  tags = merge(
+    local.base_tags,
+    {
+      Name = "${var.service}-${var.environment}-${each.key}-path-routing"
+    }
+  )
 }
 
 locals {
