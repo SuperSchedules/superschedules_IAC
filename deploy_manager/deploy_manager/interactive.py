@@ -15,7 +15,7 @@ from rich.align import Align
 
 from .aws_client import AWSClient
 from .config import Config
-from .cli import DeploymentManager
+from .cli import DeploymentManager, get_iac_root
 
 
 console = Console()
@@ -45,6 +45,7 @@ class InteractiveDashboard:
         self.selected_action = 0
         self.actions = [
             ("Deploy to Inactive Environment", "deploy"),
+            ("Deploy and Flip (auto)", "deploy_and_flip"),
             ("Flip Traffic", "flip"),
             ("Scale Down Inactive", "scale_down"),
             ("Refresh Status", "refresh"),
@@ -87,8 +88,12 @@ class InteractiveDashboard:
         blue_panel = self._create_env_panel("Blue", blue_status, active_env == "blue")
         green_panel = self._create_env_panel("Green", green_status, active_env == "green")
 
-        # Cost summary
-        total_cost = blue_status.get("total_hourly_cost", 0) + green_status.get("total_hourly_cost", 0)
+        # Celery Beat status
+        beat_status = self.aws.get_celery_beat_status()
+        beat_panel = self._create_celery_beat_panel(beat_status)
+
+        # Cost summary (include celery-beat)
+        total_cost = blue_status.get("total_hourly_cost", 0) + green_status.get("total_hourly_cost", 0) + beat_status.get("hourly_cost", 0)
         cost_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
         cost_table.add_row("Hourly:", f"[green]${total_cost:.4f}/hr[/green]")
         cost_table.add_row("Daily:", f"[green]${total_cost * 24:.2f}/day[/green]")
@@ -100,7 +105,7 @@ class InteractiveDashboard:
             box=box.ROUNDED
         )
 
-        return Group(blue_panel, green_panel, cost_panel)
+        return Group(blue_panel, green_panel, beat_panel, cost_panel)
 
     def _create_env_panel(self, name: str, status: dict, is_active: bool) -> Panel:
         """Create panel for single environment."""
@@ -194,6 +199,53 @@ class InteractiveDashboard:
 
         return Panel(Group(*lines), title=title, border_style=color, box=box.ROUNDED)
 
+    def _create_celery_beat_panel(self, status: dict) -> Panel:
+        """Create panel for Celery Beat instance."""
+        title = "⏰ Celery Beat (Scheduler)"
+
+        if not status.get("exists") or not status.get("instance"):
+            content = Text("No instance running", style="dim yellow")
+            return Panel(content, title=title, border_style="yellow", box=box.ROUNDED)
+
+        instance = status["instance"]
+        lines = []
+
+        # Instance info
+        uptime = instance["uptime"]
+        uptime_str = f"{uptime['days']}d {uptime['hours']}h {uptime['minutes']}m"
+        lifecycle = "Spot" if instance["lifecycle"] == "spot" else "On-Demand"
+        lifecycle_style = "yellow" if instance["lifecycle"] == "spot" else "blue"
+
+        state = instance["state"]
+        state_style = "green" if state == "running" else "yellow"
+
+        line = Text()
+        line.append(f"  • {instance['instance_id']}: ", style="dim")
+        line.append(f"{instance['instance_type']} ", style="white")
+        line.append(f"{lifecycle} ", style=lifecycle_style)
+        line.append(f"{state} ", style=state_style)
+        line.append(f"↑{uptime_str} ", style="dim")
+        line.append(f"${instance['hourly_cost']:.4f}/hr", style="green")
+        lines.append(line)
+
+        # Status indicator
+        status_line = Text("\n  ")
+        if state == "running":
+            status_line.append("● ", style="green")
+            status_line.append("Scheduling tasks", style="green")
+        else:
+            status_line.append("◐ ", style="yellow")
+            status_line.append("Starting...", style="yellow")
+        lines.append(status_line)
+
+        # Cost
+        cost_line = Text(f"\n💰 Cost: ", style="white")
+        cost_line.append(f"${status['hourly_cost']:.4f}/hr", style="green")
+        cost_line.append(f" (${status['monthly_cost']:.2f}/mo est)", style="dim green")
+        lines.append(cost_line)
+
+        return Panel(Group(*lines), title=title, border_style="yellow", box=box.ROUNDED)
+
     def create_menu(self) -> Panel:
         """Create interactive menu."""
         table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
@@ -260,6 +312,17 @@ class InteractiveDashboard:
             input()
             return True
 
+        if action_key == "deploy_and_flip":
+            # Deploy to inactive, wait 30s, then flip - all automatic
+            console.clear()
+            success = self.manager.deploy_and_flip(wait_seconds=30)
+            if success:
+                console.print("\n[green]Press any key to return to dashboard...[/green]")
+            else:
+                console.print("\n[red]Press any key to return to dashboard...[/red]")
+            input()
+            return True
+
         if action_key == "flip":
             console.clear()
             console.print("[bold cyan]Flipping traffic...[/bold cyan]\n")
@@ -287,7 +350,7 @@ class InteractiveDashboard:
             try:
                 import subprocess
                 cmd = f"make deploy:scale-down-{inactive_env} ACTIVE_DESIRED_CAPACITY={active_capacity}"
-                result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True, cwd=get_iac_root())
                 console.print(result.stdout)
                 console.print(f"\n[green]✓ {inactive_env.upper()} scaled down successfully![/green]")
                 console.print(f"[green]✓ {active_env.upper()} capacity preserved at {active_capacity}[/green]")
@@ -328,7 +391,7 @@ class InteractiveDashboard:
 
             # Get user input
             try:
-                choice = console.input("[bold cyan]Select action (1-5, or 'q' to quit): [/bold cyan]").strip().lower()
+                choice = console.input("[bold cyan]Select action (1-6, or 'q' to quit): [/bold cyan]").strip().lower()
 
                 if choice == 'q':
                     break
@@ -344,7 +407,7 @@ class InteractiveDashboard:
                         if not self.run_action(action_key):
                             break
                     else:
-                        self.set_message("Invalid choice. Please select 1-5.", "error")
+                        self.set_message(f"Invalid choice. Please select 1-{len(self.actions)}.", "error")
                 else:
                     self.set_message("Invalid input. Please enter a number or 'q'.", "error")
 

@@ -3,8 +3,19 @@
 import sys
 import time
 import subprocess
+from pathlib import Path
 from typing import Dict, Optional
 import click
+
+
+def get_iac_root() -> Path:
+    """Get the root directory of the IAC repo.
+
+    This allows the deploy manager to work from any directory.
+    """
+    # This file is at deploy_manager/deploy_manager/cli.py
+    # IAC root is ../../ from here
+    return Path(__file__).resolve().parent.parent.parent
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -35,7 +46,8 @@ class DeploymentManager:
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=5  # Add timeout to prevent hanging on state lock
+                timeout=5,  # Add timeout to prevent hanging on state lock
+                cwd=get_iac_root()
             )
             import json
             active = json.loads(result.stdout)
@@ -234,7 +246,7 @@ class DeploymentManager:
             box=box.ROUNDED
         ))
 
-    def deploy_to_inactive(self):
+    def deploy_to_inactive(self, skip_confirm: bool = False):
         """Deploy to the inactive environment and monitor progress."""
         active_env = self.get_active_environment()
 
@@ -247,8 +259,8 @@ class DeploymentManager:
         console.print(f"\n[bold]Current active environment:[/bold] [cyan]{active_env.upper()}[/cyan]")
         console.print(f"[bold]Deploying to:[/bold] [cyan]{target_env.upper()}[/cyan]\n")
 
-        # Confirm deployment
-        if not click.confirm(f"Deploy new version to {target_env.upper()}?", default=True):
+        # Confirm deployment (unless skipped)
+        if not skip_confirm and not click.confirm(f"Deploy new version to {target_env.upper()}?", default=True):
             console.print("[yellow]Deployment cancelled.[/yellow]")
             return False
 
@@ -284,7 +296,8 @@ class DeploymentManager:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                cwd=get_iac_root()
             )
 
             # Stream output
@@ -299,6 +312,10 @@ class DeploymentManager:
 
             console.print(f"\n[green]Deployment command completed![/green]\n")
 
+            # Terminate celery-beat to force recreation with new image
+            console.print(f"[bold cyan]Restarting Celery Beat with new image...[/bold cyan]\n")
+            self._restart_celery_beat()
+
             # Monitor until healthy
             console.print(f"[bold cyan]Monitoring {target_env} environment health...[/bold cyan]\n")
             return self._monitor_deployment(target_env)
@@ -309,6 +326,28 @@ class DeploymentManager:
         except Exception as e:
             console.print(f"\n[red]Deployment error: {e}[/red]")
             return False
+
+    def _restart_celery_beat(self):
+        """Terminate celery-beat instance to force recreation with new image."""
+        try:
+            # Get celery-beat instance ID
+            beat_asg = "superschedules-prod-celery-beat-asg"
+            asg_info = self.aws.get_asg_info(beat_asg)
+
+            if not asg_info or not asg_info.get("Instances"):
+                console.print("[dim]No celery-beat instance found, skipping restart[/dim]")
+                return
+
+            instance_id = asg_info["Instances"][0]["InstanceId"]
+            console.print(f"[dim]Terminating celery-beat instance {instance_id}...[/dim]")
+
+            # Terminate the instance - ASG will recreate it automatically
+            self.aws.ec2.terminate_instances(InstanceIds=[instance_id])
+            console.print("[green]✓ Celery-beat instance terminated (ASG will recreate with new image)[/green]\n")
+
+        except Exception as e:
+            console.print(f"[yellow]Warning: Failed to restart celery-beat: {e}[/yellow]")
+            console.print("[dim]You may need to manually restart it later[/dim]\n")
 
     def _monitor_deployment(self, environment: str) -> bool:
         """Monitor deployment until healthy or timeout."""
@@ -406,7 +445,7 @@ class DeploymentManager:
         console.print("[red]Timeout waiting for environment to become healthy.[/red]")
         return False
 
-    def flip_traffic(self, target_env: Optional[str] = None):
+    def flip_traffic(self, target_env: Optional[str] = None, skip_confirm: bool = False):
         """Flip traffic to specified environment or auto-detect inactive."""
         active_env = self.get_active_environment()
         active_capacity = self.get_active_capacity()
@@ -417,7 +456,7 @@ class DeploymentManager:
         console.print(f"\n[bold]Current active:[/bold] [cyan]{active_env.upper()}[/cyan]")
         console.print(f"[bold yellow]⚠ WARNING: This will switch production traffic to {target_env.upper()}![/bold yellow]\n")
 
-        if not click.confirm(f"Are you sure you want to flip traffic to {target_env.upper()}?", default=False):
+        if not skip_confirm and not click.confirm(f"Are you sure you want to flip traffic to {target_env.upper()}?", default=False):
             console.print("[yellow]Traffic flip cancelled.[/yellow]")
             return False
 
@@ -434,7 +473,7 @@ class DeploymentManager:
 
             console.print(f"\n[dim]Running: {cmd}[/dim]\n")
 
-            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True, cwd=get_iac_root())
             console.print(result.stdout)
 
             console.print(f"\n[green]✓ Traffic successfully flipped to {target_env.upper()}![/green]")
@@ -445,6 +484,56 @@ class DeploymentManager:
             if e.stderr:
                 console.print(f"[red]{e.stderr}[/red]")
             return False
+
+    def deploy_and_flip(self, wait_seconds: int = 30):
+        """Deploy to inactive environment, wait, then flip traffic automatically."""
+        active_env = self.get_active_environment()
+
+        if active_env == "unknown":
+            console.print("[red]Cannot determine active environment. Please check manually.[/red]")
+            return False
+
+        target_env = "green" if active_env == "blue" else "blue"
+
+        console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
+        console.print(f"[bold cyan]  DEPLOY AND FLIP - Automated Deployment[/bold cyan]")
+        console.print(f"[bold cyan]{'='*60}[/bold cyan]\n")
+        console.print(f"[bold]Current active:[/bold] [cyan]{active_env.upper()}[/cyan]")
+        console.print(f"[bold]Will deploy to:[/bold] [cyan]{target_env.upper()}[/cyan]")
+        console.print(f"[bold]Then flip traffic after {wait_seconds}s stabilization period[/bold]\n")
+
+        # Deploy without confirmation
+        success = self.deploy_to_inactive(skip_confirm=True)
+
+        if not success:
+            console.print("\n[red]Deployment failed. Aborting flip.[/red]")
+            return False
+
+        # Wait for stabilization
+        console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
+        console.print(f"[bold green]✓ Deployment healthy! Waiting {wait_seconds}s before flip...[/bold green]")
+        console.print(f"[bold cyan]{'='*60}[/bold cyan]\n")
+
+        for remaining in range(wait_seconds, 0, -1):
+            console.print(f"\r[cyan]Flipping traffic in {remaining}s...[/cyan]  ", end="")
+            time.sleep(1)
+
+        console.print("\n")
+
+        # Flip traffic without confirmation
+        success = self.flip_traffic(target_env=target_env, skip_confirm=True)
+
+        if success:
+            console.print(f"\n[bold green]{'='*60}[/bold green]")
+            console.print(f"[bold green]  ✓ DEPLOY AND FLIP COMPLETE![/bold green]")
+            console.print(f"[bold green]  Traffic now routing to {target_env.upper()}[/bold green]")
+            console.print(f"[bold green]{'='*60}[/bold green]\n")
+        else:
+            console.print(f"\n[bold red]Traffic flip failed after successful deployment.[/bold red]")
+            console.print(f"[yellow]The new version is deployed to {target_env} but not receiving traffic.[/yellow]")
+            console.print(f"[yellow]You can manually flip with: deploy-manager flip[/yellow]\n")
+
+        return success
 
 
 @click.group()
@@ -513,6 +602,26 @@ def flip(target_env):
     config = Config()
     manager = DeploymentManager(config)
     manager.flip_traffic(target_env)
+
+
+@cli.command("deploy-and-flip")
+@click.option("--wait", "wait_seconds", default=30, help="Seconds to wait after deploy before flip")
+def deploy_and_flip(wait_seconds):
+    """Deploy to inactive environment and automatically flip traffic.
+
+    This is an automated workflow that:
+    1. Deploys to the inactive environment
+    2. Waits for it to become healthy
+    3. Waits an additional stabilization period (default 30s)
+    4. Automatically flips traffic to the new environment
+
+    No confirmation prompts - fully automated.
+    """
+    config = Config()
+    manager = DeploymentManager(config)
+    success = manager.deploy_and_flip(wait_seconds=wait_seconds)
+    if not success:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
