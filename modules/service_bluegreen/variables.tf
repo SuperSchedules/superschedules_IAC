@@ -289,3 +289,27 @@ variable "additional_instance_tags" {
   description = "Extra tags propagated to instances launched by the Auto Scaling Groups."
   default     = {}
 }
+
+variable "instance_types" {
+  type        = list(string)
+  description = "List of instance types for mixed instances policy. If empty, uses launch template instance type. Example: [\"t3.micro\", \"t3a.micro\", \"t2.micro\"]"
+  default     = []
+}
+
+variable "spot_allocation_strategy" {
+  type        = string
+  description = "Strategy for spot instances: lowest-price, capacity-optimized, capacity-optimized-prioritized, or price-capacity-optimized"
+  default     = "price-capacity-optimized"
+}
+
+variable "on_demand_base_capacity" {
+  type        = number
+  description = "Minimum number of on-demand instances (rest will be spot)"
+  default     = 0
+}
+
+variable "on_demand_percentage_above_base" {
+  type        = number
+  description = "Percentage of on-demand instances above base capacity (0-100)"
+  default     = 0
+}

@@ -10,7 +10,7 @@ data "aws_ami" "ubuntu" {
 resource "aws_launch_template" "app" {
   name_prefix   = "superschedules-prod-lt-"
   image_id      = data.aws_ami.ubuntu.id
-  instance_type = var.app_instance_type
+  # instance_type removed - will be specified via mixed_instances_policy in ASG
   user_data     = base64encode(templatefile("${path.module}/templates/user_data.sh.tftpl", {
     region          = var.aws_region,
     aws_account_id  = data.aws_caller_identity.current.account_id,
@@ -22,7 +22,6 @@ resource "aws_launch_template" "app" {
     db_port         = 5432,
     db_name         = var.db_name,
     db_username     = var.db_username,
-    db_password     = local.db_password_effective,
     static_bucket   = aws_s3_bucket.static.bucket,
     django_settings_module = var.django_settings_module,
     alb_dns_name    = aws_lb.app.dns_name
@@ -45,14 +44,8 @@ resource "aws_launch_template" "app" {
     }
   }
 
-  # Use spot instances for cost savings (~68% cheaper)
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      max_price = ""  # Use current spot price
-      # Note: ASG only supports one-time spot instances
-    }
-  }
+  # Note: Spot configuration is handled by mixed_instances_policy in the ASG
+  # Do not add instance_market_options here as it conflicts with mixed_instances_policy
 
   tag_specifications {
     resource_type = "instance"

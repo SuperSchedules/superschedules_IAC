@@ -69,6 +69,70 @@ resource "aws_iam_role_policy_attachment" "bedrock_access" {
   policy_arn = aws_iam_policy.bedrock_access.arn
 }
 
+# Secrets Manager IAM policy is manually managed due to Terraform role permissions
+# Policy ARN: arn:aws:iam::353130947195:policy/superschedules-prod-secrets-access
+# Attached to: superschedules-prod-ec2-role
+
+# CloudWatch Logs policy for Docker container logging (inline policy to avoid IAM CreatePolicy permission issues)
+resource "aws_iam_role_policy" "cloudwatch_logs" {
+  name = "superschedules-prod-cloudwatch-logs"
+  role = aws_iam_role.ec2.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = [
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/superschedules/prod/app",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/superschedules/prod/app:*"
+        ]
+      }
+    ]
+  })
+}
+
+# SQS policy for Celery broker (inline policy to avoid IAM CreatePolicy permission issues)
+resource "aws_iam_role_policy" "sqs_access" {
+  name = "superschedules-prod-sqs-access"
+  role = aws_iam_role.ec2.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:CreateQueue",
+          "sqs:DeleteQueue",
+          "sqs:GetQueueUrl",
+          "sqs:GetQueueAttributes",
+          "sqs:SetQueueAttributes",
+          "sqs:SendMessage",
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:ChangeMessageVisibility",
+          "sqs:PurgeQueue"
+        ]
+        Resource = "arn:aws:sqs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:superschedules-*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ListQueues"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "ec2" {
   name = "superschedules-prod-instance-profile"
   role = aws_iam_role.ec2.name

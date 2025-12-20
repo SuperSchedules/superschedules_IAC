@@ -5,19 +5,18 @@ REGION=${region}
 APP_DIR=/opt/superschedules
 mkdir -p "$APP_DIR"
 
-# Create swap file (2GB for t3.micro with 1GB RAM)
+# Create swap file (1GB for t3.nano with 512MB RAM)
 if [ ! -f /swapfile ]; then
-  dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
+  dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress
   chmod 600 /swapfile
   mkswap /swapfile
   swapon /swapfile
   echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  # Set swappiness to 10 (prefer RAM, use swap as backup)
   sysctl vm.swappiness=10
   echo 'vm.swappiness=10' >> /etc/sysctl.conf
 fi
 
-# Install Docker and compose plugin
+# Install Docker
 if command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
@@ -48,25 +47,12 @@ DB_PASSWORD=$(echo "$SECRET_JSON" | jq -r '.DB_PASSWORD')
 DJANGO_SECRET_KEY=$(echo "$SECRET_JSON" | jq -r '.DJANGO_SECRET_KEY')
 EMAIL_HOST_USER=$(echo "$SECRET_JSON" | jq -r '.EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD=$(echo "$SECRET_JSON" | jq -r '.EMAIL_HOST_PASSWORD')
-TURNSTILE_SECRET_KEY=$(echo "$SECRET_JSON" | jq -r '.TURNSTILE_SECRET_KEY // empty')
 
 cat > "$APP_DIR/docker-compose.yml" <<YAML
 services:
-  frontend:
-    image: ${nginx_image}
-    ports:
-      - "80:80"
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${region}
-        awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: frontend
-        awslogs-create-group: "true"
-  django:
+  celery-beat:
     image: ${django_image}
-    ports:
-      - "8000:8000"
+    command: celery -A config beat --loglevel=INFO --scheduler=django_celery_beat.schedulers:DatabaseScheduler
     environment:
       - DJANGO_SETTINGS_MODULE=${django_settings_module}
       - DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY
@@ -77,67 +63,19 @@ services:
       - DB_PASSWORD=$DB_PASSWORD
       - AWS_REGION=${region}
       - USE_SQS_BROKER=True
-      - AWS_S3_BUCKET=${static_bucket}
-      - ALB_HOST=${alb_dns_name}
-      - DEBUG=False
-      - LLM_PROVIDER=bedrock
-      - AWS_BEDROCK_REGION=${region}
-      - COLLECTOR_URL=http://collector:8001
-      - NAVIGATOR_URL=http://navigator:8004
       - EMAIL_HOST_USER=$EMAIL_HOST_USER
       - EMAIL_HOST_PASSWORD=$EMAIL_HOST_PASSWORD
       - DEFAULT_FROM_EMAIL=noreply@eventzombie.com
       - EMAIL_HOST=email-smtp.us-east-1.amazonaws.com
       - EMAIL_PORT=587
       - EMAIL_USE_TLS=True
-      - FRONTEND_URL=https://eventzombie.com
-      - TURNSTILE_SECRET_KEY=$TURNSTILE_SECRET_KEY
-    depends_on:
-      - wait-for-db
+    restart: unless-stopped
     logging:
       driver: awslogs
       options:
         awslogs-region: ${region}
         awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: django
-        awslogs-create-group: "true"
-  collector:
-    image: ${collector_image}
-    ports:
-      - "8001:8001"
-    environment:
-      - DATABASE_URL=postgresql://${db_username}:$DB_PASSWORD@${db_host}:${db_port}/${db_name}
-      - AWS_REGION=${region}
-      - AWS_S3_BUCKET=${static_bucket}
-    depends_on:
-      - wait-for-db
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${region}
-        awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: collector
-        awslogs-create-group: "true"
-  navigator:
-    image: ${fastapi_image}
-    ports:
-      - "8004:8004"
-    environment:
-      - DB_HOST=${db_host}
-      - DB_PORT=${db_port}
-      - DB_NAME=${db_name}
-      - DB_USER=${db_username}
-      - DB_PASSWORD=$DB_PASSWORD
-      - AWS_REGION=${region}
-      - AWS_S3_BUCKET=${static_bucket}
-    depends_on:
-      - wait-for-db
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${region}
-        awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: navigator
+        awslogs-stream: celery-beat
         awslogs-create-group: "true"
   celery-worker:
     image: ${django_image}
@@ -152,32 +90,25 @@ services:
       - DB_PASSWORD=$DB_PASSWORD
       - AWS_REGION=${region}
       - USE_SQS_BROKER=True
-      - AWS_S3_BUCKET=${static_bucket}
-      - COLLECTOR_URL=http://collector:8001
       - EMAIL_HOST_USER=$EMAIL_HOST_USER
       - EMAIL_HOST_PASSWORD=$EMAIL_HOST_PASSWORD
       - DEFAULT_FROM_EMAIL=noreply@eventzombie.com
       - EMAIL_HOST=email-smtp.us-east-1.amazonaws.com
       - EMAIL_PORT=587
       - EMAIL_USE_TLS=True
-    depends_on:
-      - wait-for-db
     restart: unless-stopped
     logging:
       driver: awslogs
       options:
         awslogs-region: ${region}
         awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: celery-worker
+        awslogs-stream: celery-worker-beat-instance
         awslogs-create-group: "true"
-  wait-for-db:
-    image: public.ecr.aws/bitnami/postgresql:15
-    command: ["/bin/bash", "-lc", "until pg_isready -h ${db_host} -p ${db_port} -U ${db_username}; do echo waiting for db; sleep 3; done"]
 YAML
 
-cat > /etc/systemd/system/superschedules.service <<UNIT
+cat > /etc/systemd/system/celery-beat.service <<UNIT
 [Unit]
-Description=Superschedules stack
+Description=Celery Beat scheduler
 After=docker.service
 Requires=docker.service
 
@@ -196,18 +127,7 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable superschedules
-systemctl start superschedules
+systemctl enable celery-beat
+systemctl start celery-beat
 
-# Wait for services to be healthy
-sleep 30
-
-# Enable pgvector extension (idempotent)
-DJANGO_CONTAINER=$(docker compose -f /opt/superschedules/docker-compose.yml ps -q django)
-docker exec "$DJANGO_CONTAINER" python manage.py shell -c "from django.db import connection; cursor = connection.cursor(); cursor.execute('CREATE EXTENSION IF NOT EXISTS vector;'); print('pgvector extension enabled')" || echo "pgvector extension creation failed"
-
-# Run Django migrations (creates tables and enables pgvector)
-docker exec "$DJANGO_CONTAINER" python manage.py migrate --noinput || echo "Migration failed - may need manual intervention"
-
-echo "Bootstrapping complete"
-
+echo "Celery Beat instance bootstrapping complete"

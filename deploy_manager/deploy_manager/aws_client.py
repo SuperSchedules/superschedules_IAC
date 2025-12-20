@@ -132,3 +132,68 @@ class AWSClient:
             "total_hourly_cost": total_hourly_cost,
             "total_monthly_cost": total_hourly_cost * 730  # Approximate month hours
         }
+
+    def get_celery_beat_status(self) -> Dict:
+        """Get Celery Beat instance status."""
+        asg_name = "superschedules-prod-celery-beat-asg"
+        asg_info = self.get_asg_info(asg_name)
+
+        if not asg_info:
+            return {
+                "exists": False,
+                "instance": None,
+                "hourly_cost": 0.0,
+                "monthly_cost": 0.0
+            }
+
+        # Get instance details
+        instance_ids = [i["InstanceId"] for i in asg_info.get("Instances", [])]
+        if not instance_ids:
+            return {
+                "exists": True,
+                "instance": None,
+                "hourly_cost": 0.0,
+                "monthly_cost": 0.0
+            }
+
+        instances = self.get_instance_details(instance_ids)
+        if not instances:
+            return {
+                "exists": True,
+                "instance": None,
+                "hourly_cost": 0.0,
+                "monthly_cost": 0.0
+            }
+
+        instance = instances[0]  # Should only be one
+        instance_type = instance["InstanceType"]
+        lifecycle = instance.get("InstanceLifecycle", "on-demand")
+        launch_time = instance["LaunchTime"]
+        az = instance["Placement"]["AvailabilityZone"]
+
+        # Get pricing (t3.nano)
+        if lifecycle == "spot":
+            spot_price = self.get_spot_price(instance_type, az)
+            hourly_cost = spot_price if spot_price else 0.0016  # Fallback to approximate spot price
+        else:
+            hourly_cost = 0.0052  # t3.nano on-demand hourly price
+
+        days, hours, minutes = self.calculate_instance_uptime(launch_time)
+
+        instance_detail = {
+            "instance_id": instance["InstanceId"],
+            "instance_type": instance_type,
+            "lifecycle": lifecycle,
+            "state": instance["State"]["Name"],
+            "launch_time": launch_time,
+            "uptime": {"days": days, "hours": hours, "minutes": minutes},
+            "hourly_cost": hourly_cost,
+            "availability_zone": az
+        }
+
+        return {
+            "exists": True,
+            "instance": instance_detail,
+            "hourly_cost": hourly_cost,
+            "monthly_cost": hourly_cost * 730
+        }

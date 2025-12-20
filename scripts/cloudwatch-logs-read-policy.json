@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents",
+        "logs:StartQuery",
+        "logs:StopQuery",
+        "logs:GetQueryResults"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-1:353130947195:log-group:/aws/superschedules/prod/app",
+        "arn:aws:logs:us-east-1:353130947195:log-group:/aws/superschedules/prod/app:*"
+      ]
+    }
+  ]
+}

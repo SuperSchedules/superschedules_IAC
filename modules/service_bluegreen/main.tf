@@ -101,9 +101,41 @@ resource "aws_autoscaling_group" "this" {
     tg.arn if local.target_groups_map[tg_key].color == each.key
   ]
 
-  launch_template {
-    id      = var.launch_template_id
-    version = var.launch_template_version
+  # Use mixed instances policy if instance_types is provided, otherwise use simple launch template
+  dynamic "mixed_instances_policy" {
+    for_each = length(var.instance_types) > 0 ? [1] : []
+
+    content {
+      launch_template {
+        launch_template_specification {
+          launch_template_id = var.launch_template_id
+          version            = var.launch_template_version
+        }
+
+        dynamic "override" {
+          for_each = var.instance_types
+          content {
+            instance_type = override.value
+          }
+        }
+      }
+
+      instances_distribution {
+        on_demand_base_capacity                  = var.on_demand_base_capacity
+        on_demand_percentage_above_base_capacity = var.on_demand_percentage_above_base
+        spot_allocation_strategy                 = var.spot_allocation_strategy
+      }
+    }
+  }
+
+  # Fallback to simple launch template if no instance_types specified
+  dynamic "launch_template" {
+    for_each = length(var.instance_types) == 0 ? [1] : []
+
+    content {
+      id      = var.launch_template_id
+      version = var.launch_template_version
+    }
   }
 
   dynamic "tag" {
