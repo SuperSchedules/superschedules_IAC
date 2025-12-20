@@ -57,6 +57,13 @@ data "aws_iam_policy_document" "bedrock_access" {
       "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
     ]
   }
+
+  statement {
+    actions = [
+      "bedrock:ListFoundationModels"
+    ]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_policy" "bedrock_access" {
