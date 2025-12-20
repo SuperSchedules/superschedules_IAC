@@ -79,7 +79,7 @@ services:
         awslogs-create-group: "true"
   celery-worker:
     image: ${django_image}
-    command: celery -A config worker --loglevel=INFO --concurrency=1 --queues=default,embeddings,geocoding,scraping
+    command: celery -A config worker --loglevel=INFO --concurrency=1 --queues=default,geocoding,scraping
     environment:
       - DJANGO_SETTINGS_MODULE=${django_settings_module}
       - DJANGO_SECRET_KEY=$DJANGO_SECRET_KEY

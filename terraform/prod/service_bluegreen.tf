@@ -60,8 +60,8 @@ module "service_bluegreen" {
   lifecycle_notification_target_arn = var.lifecycle_notification_target_arn
   lifecycle_notification_role_arn   = var.lifecycle_notification_role_arn
 
-  # Multiple instance types for better spot availability
-  instance_types = ["t3.micro", "t3a.micro", "t2.micro"]
+  # Multiple instance types for better spot availability (2GB RAM for RAG model)
+  instance_types = ["t3.small", "t3a.small", "t2.small"]
   spot_allocation_strategy = "price-capacity-optimized"
   on_demand_base_capacity = 0  # All instances can be spot
   on_demand_percentage_above_base = 0  # 100% spot
