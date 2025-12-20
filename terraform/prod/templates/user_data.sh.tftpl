@@ -82,8 +82,6 @@ services:
       - DEBUG=False
       - LLM_PROVIDER=bedrock
       - AWS_BEDROCK_REGION=${region}
-      - COLLECTOR_URL=http://collector:8001
-      - NAVIGATOR_URL=http://navigator:8004
       - EMAIL_HOST_USER=$EMAIL_HOST_USER
       - EMAIL_HOST_PASSWORD=$EMAIL_HOST_PASSWORD
       - DEFAULT_FROM_EMAIL=noreply@eventzombie.com
@@ -101,44 +99,6 @@ services:
         awslogs-group: /aws/superschedules/prod/app
         awslogs-stream: django
         awslogs-create-group: "true"
-  collector:
-    image: ${collector_image}
-    ports:
-      - "8001:8001"
-    environment:
-      - DATABASE_URL=postgresql://${db_username}:$DB_PASSWORD@${db_host}:${db_port}/${db_name}
-      - AWS_REGION=${region}
-      - AWS_S3_BUCKET=${static_bucket}
-    depends_on:
-      - wait-for-db
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${region}
-        awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: collector
-        awslogs-create-group: "true"
-  navigator:
-    image: ${fastapi_image}
-    ports:
-      - "8004:8004"
-    environment:
-      - DB_HOST=${db_host}
-      - DB_PORT=${db_port}
-      - DB_NAME=${db_name}
-      - DB_USER=${db_username}
-      - DB_PASSWORD=$DB_PASSWORD
-      - AWS_REGION=${region}
-      - AWS_S3_BUCKET=${static_bucket}
-    depends_on:
-      - wait-for-db
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${region}
-        awslogs-group: /aws/superschedules/prod/app
-        awslogs-stream: navigator
-        awslogs-create-group: "true"
   celery-worker:
     image: ${django_image}
     command: celery -A config worker --loglevel=INFO --concurrency=1 --queues=default,embeddings,geocoding,scraping
@@ -153,7 +113,6 @@ services:
       - AWS_REGION=${region}
       - USE_SQS_BROKER=True
       - AWS_S3_BUCKET=${static_bucket}
-      - COLLECTOR_URL=http://collector:8001
       - EMAIL_HOST_USER=$EMAIL_HOST_USER
       - EMAIL_HOST_PASSWORD=$EMAIL_HOST_PASSWORD
       - DEFAULT_FROM_EMAIL=noreply@eventzombie.com
