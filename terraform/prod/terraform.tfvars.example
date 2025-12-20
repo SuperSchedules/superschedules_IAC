@@ -1,8 +1,6 @@
 # Required images (use tags pushed by GitHub Actions)
 nginx_image     = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-frontend:latest"
 django_image    = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-api:latest"
-fastapi_image   = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-navigator:latest"
-collector_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/superschedules-collector:latest"
 
 # S3 bucket name must be globally unique
 static_bucket_name = "superschedules-prod-static-123456789012"

@@ -16,8 +16,6 @@ resource "aws_launch_template" "app" {
     aws_account_id  = data.aws_caller_identity.current.account_id,
     nginx_image     = var.nginx_image,
     django_image    = var.django_image,
-    fastapi_image   = var.fastapi_image,
-    collector_image = var.collector_image,
     db_host         = aws_db_instance.postgres.address,
     db_port         = 5432,
     db_name         = var.db_name,

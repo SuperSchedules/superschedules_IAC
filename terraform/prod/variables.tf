@@ -82,15 +82,6 @@ variable "django_image" {
   type        = string
 }
 
-variable "fastapi_image" {
-  description = "ECR image URI:tag for FastAPI"
-  type        = string
-}
-
-variable "collector_image" {
-  description = "ECR image URI:tag for Collector"
-  type        = string
-}
 
 variable "django_settings_module" {
   description = "Python path to Django settings module"
