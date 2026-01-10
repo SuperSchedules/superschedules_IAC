@@ -7,6 +7,51 @@ locals {
     navigator = "superschedules-navigator" # Used as fastapi
     collector = "superschedules-collector"
   }
+
+  # Shared lifecycle policy: keep main-* tags for rollback
+  ecr_lifecycle_policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Delete untagged images after 7 days"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 7
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep last 20 main-* tagged images for rollback"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["main-"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 20
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 3
+        description  = "Keep last 5 other tagged images"
+        selection = {
+          tagStatus   = "tagged"
+          tagPrefixList = ["latest", "dev-", "staging-"]
+          countType   = "imageCountMoreThan"
+          countNumber = 5
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
 }
 
 # Frontend repository (nginx)
@@ -28,35 +73,7 @@ resource "aws_ecr_repository" "frontend" {
 
 resource "aws_ecr_lifecycle_policy" "nginx" {
   repository = aws_ecr_repository.frontend.name
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Delete untagged images after 7 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep last 3 images, delete others"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 3
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
+  policy     = local.ecr_lifecycle_policy
 }
 
 # API repository (django)
@@ -78,35 +95,7 @@ resource "aws_ecr_repository" "api" {
 
 resource "aws_ecr_lifecycle_policy" "api" {
   repository = aws_ecr_repository.api.name
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Delete untagged images after 7 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep last 3 images, delete others"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 3
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
+  policy     = local.ecr_lifecycle_policy
 }
 
 # Navigator repository (fastapi)
@@ -128,35 +117,7 @@ resource "aws_ecr_repository" "navigator" {
 
 resource "aws_ecr_lifecycle_policy" "navigator" {
   repository = aws_ecr_repository.navigator.name
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Delete untagged images after 7 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep last 3 images, delete others"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 3
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
+  policy     = local.ecr_lifecycle_policy
 }
 
 # Collector repository
@@ -178,33 +139,5 @@ resource "aws_ecr_repository" "collector" {
 
 resource "aws_ecr_lifecycle_policy" "collector" {
   repository = aws_ecr_repository.collector.name
-  policy = jsonencode({
-    rules = [
-      {
-        rulePriority = 1
-        description  = "Delete untagged images after 7 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
-      },
-      {
-        rulePriority = 2
-        description  = "Keep last 3 images, delete others"
-        selection = {
-          tagStatus   = "any"
-          countType   = "imageCountMoreThan"
-          countNumber = 3
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
+  policy     = local.ecr_lifecycle_policy
 }

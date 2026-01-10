@@ -1,9 +1,37 @@
 # Superschedules IAC
 
-This repository contains Terraform configuration for the Superschedules project. The Terraform code lives under the `terraform/`
-directory and is organized into environments for development (both EC2 and local) and production. The development configuration
-installs required packages, clones several Git repositories via separate setup scripts, and can optionally provision an AWS EC2
-instance for the dev environment.
+Terraform infrastructure for the Superschedules platform on AWS.
+
+## Environments
+
+| Environment | Description | Deploy Time | Cost |
+|-------------|-------------|-------------|------|
+| **prod** | Docker + ALB, blue/green deployments | ~11 min | ~$50-80/mo |
+| **prod-lite** | Non-Docker, single spot instance, fast deploys | ~30 sec | ~$15-20/mo |
+| **dev** | Local or EC2 development environment | N/A | Variable |
+
+## Quick Start
+
+### Prod-Lite (Recommended for Development)
+
+```bash
+cd terraform/prod-lite
+echo 'certbot_email = "your@email.com"' > terraform.tfvars
+terraform init && terraform apply
+
+# Wait ~10 min for bootstrap, then:
+make prod-lite-deploy    # Fast deploy (~30s)
+make prod-lite-shell     # SSM session
+make prod-lite-status    # Check health
+```
+
+### Prod (Docker + ALB)
+
+```bash
+make prod-deploy                    # Deploy to inactive environment
+make deploy:flip                    # Switch traffic
+make deploy:rollback                # Roll back if needed
+```
 
 ## Usage
 
@@ -146,6 +174,59 @@ To roll back, run `make deploy:rollback`. This sends 100% of traffic back to blu
 If importing the listener is not desirable, set `listener_arn = null` and Terraform will create a fresh listener that can be promoted once traffic is off the legacy resources.
 
 When `listener_arn` is supplied the module installs an all-path (`/*`) listener rule instead of modifying the default action so the pre-existing listener is never replaced. Ensure there are no higher-priority rules that would override this catch-all route.
+
+## Prod-Lite Environment
+
+Prod-lite is a lightweight alternative to the Docker+ALB production stack, optimized for fast iteration:
+
+- **Single t3.medium spot instance** (~$15-20/month vs ~$50-80/month)
+- **No Docker** - runs gunicorn/celery directly via systemd
+- **No ALB** - nginx + Let's Encrypt for TLS termination
+- **~30 second deploys** via SSM (vs ~11 minutes for Docker builds)
+- **Shares RDS, SQS, and Secrets** with prod environment
+
+### Architecture
+
+```
+Route53 DNS → Instance Public IP (Lambda auto-updates on launch)
+    ├── api.eventzombie.com    → nginx → gunicorn:8000
+    ├── www.eventzombie.com    → nginx → static files
+    ├── admin.eventzombie.com  → nginx → gunicorn:8000
+    └── eventzombie.com        → redirect to www
+```
+
+### Commands
+
+```bash
+# Makefile targets
+make prod-lite-apply           # Terraform apply
+make prod-lite-deploy          # Fast deploy (git pull + restart)
+make prod-lite-shell           # SSM session to instance
+make prod-lite-status          # Check health
+make prod-lite-logs            # Tail CloudWatch logs
+
+# Or use deploy-manager
+deploy-manager lite status
+deploy-manager lite deploy
+deploy-manager lite deploy -s backend   # Backend only
+deploy-manager lite shell
+deploy-manager lite logs -f
+deploy-manager lite services
+```
+
+### How Deploys Work
+
+1. SSM sends command to instance
+2. `git pull` latest code
+3. `pip install` any new dependencies
+4. `python manage.py migrate`
+5. `systemctl restart gunicorn celery-worker celery-beat`
+
+Total time: ~30 seconds
+
+### SSL Certificates
+
+Let's Encrypt certificates are obtained automatically on first boot via certbot. They auto-renew every 60-90 days. All domains share one certificate.
 
 ## Docker and CI/CD
 

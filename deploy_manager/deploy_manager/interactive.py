@@ -16,6 +16,8 @@ from rich.align import Align
 from .aws_client import AWSClient
 from .config import Config
 from .cli import DeploymentManager, get_iac_root
+from .ecr_client import ECRClient
+from .deploy_state import DeployState
 
 
 console = Console()
@@ -42,6 +44,8 @@ class InteractiveDashboard:
         self.config = Config()
         self.manager = DeploymentManager(self.config)
         self.aws = AWSClient(region=self.config.region)
+        self.ecr = ECRClient(region=self.config.region)
+        self.deploy_state = DeployState(region=self.config.region)
         self.selected_action = 0
         self.actions = [
             ("Deploy to Inactive Environment", "deploy"),
@@ -105,7 +109,10 @@ class InteractiveDashboard:
             box=box.ROUNDED
         )
 
-        return Group(blue_panel, green_panel, beat_panel, cost_panel)
+        # Version info panel
+        version_panel = self._create_version_panel()
+
+        return Group(blue_panel, green_panel, beat_panel, version_panel, cost_panel)
 
     def _create_env_panel(self, name: str, status: dict, is_active: bool) -> Panel:
         """Create panel for single environment."""
@@ -245,6 +252,69 @@ class InteractiveDashboard:
         lines.append(cost_line)
 
         return Panel(Group(*lines), title=title, border_style="yellow", box=box.ROUNDED)
+
+    def _create_version_panel(self) -> Panel:
+        """Create panel showing deployed vs available versions."""
+        title = "📦 Image Versions"
+        lines = []
+
+        try:
+            # Get deployed tag from state
+            deployed_tag = self.deploy_state.get_current_tag()
+
+            # Get latest available images from ECR
+            api_images = self.ecr.get_latest_images("superschedules-api", limit=3, tag_prefix="main-")
+
+            # Deployed version
+            deployed_line = Text("  Deployed: ", style="bold white")
+            if deployed_tag:
+                deployed_line.append(deployed_tag[:50], style="cyan")
+            else:
+                deployed_line.append("unknown", style="dim")
+            lines.append(deployed_line)
+
+            # Latest available
+            if api_images:
+                latest_tag = None
+                for t in api_images[0].get("tags", []):
+                    if t.startswith("main-"):
+                        latest_tag = t
+                        break
+
+                latest_line = Text("  Available: ", style="bold white")
+                if latest_tag:
+                    if latest_tag == deployed_tag:
+                        latest_line.append(latest_tag[:50], style="green")
+                        latest_line.append(" ✓ up to date", style="dim green")
+                    else:
+                        latest_line.append(latest_tag[:50], style="yellow")
+                        latest_line.append(" ← NEW", style="bold yellow")
+                else:
+                    latest_line.append("none", style="dim")
+                lines.append(latest_line)
+
+                # Pushed time
+                pushed_at = api_images[0].get("pushed_at")
+                if pushed_at:
+                    from datetime import timezone
+                    now = datetime.now(timezone.utc)
+                    delta = now - pushed_at
+                    if delta.days > 0:
+                        pushed_str = f"{delta.days}d ago"
+                    elif delta.seconds > 3600:
+                        pushed_str = f"{delta.seconds // 3600}h ago"
+                    else:
+                        pushed_str = f"{delta.seconds // 60}m ago"
+                    pushed_line = Text(f"  Last push: ", style="dim")
+                    pushed_line.append(pushed_str, style="dim")
+                    lines.append(pushed_line)
+            else:
+                lines.append(Text("  Available: no main-* images found", style="dim yellow"))
+
+        except Exception as e:
+            lines.append(Text(f"  Error loading version info: {str(e)[:40]}", style="dim red"))
+
+        return Panel(Group(*lines), title=title, border_style="magenta", box=box.ROUNDED)
 
     def create_menu(self) -> Panel:
         """Create interactive menu."""

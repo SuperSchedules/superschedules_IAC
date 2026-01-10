@@ -73,13 +73,27 @@ variable "app_health_check_grace_period" {
 }
 
 variable "nginx_image" {
-  description = "ECR image URI:tag for Nginx"
+  description = "ECR image URI:tag for Nginx (deprecated: use frontend_image_tag instead)"
   type        = string
+  default     = null
 }
 
 variable "django_image" {
-  description = "ECR image URI:tag for Django"
+  description = "ECR image URI:tag for Django (deprecated: use api_image_tag instead)"
   type        = string
+  default     = null
+}
+
+variable "api_image_tag" {
+  description = "Tag for superschedules-api image (e.g., main-abc1234 or latest)"
+  type        = string
+  default     = "latest"
+}
+
+variable "frontend_image_tag" {
+  description = "Tag for superschedules-frontend image (e.g., main-abc1234 or latest)"
+  type        = string
+  default     = "latest"
 }
 
 
@@ -123,6 +137,12 @@ variable "db_password" {
 variable "static_bucket_name" {
   description = "S3 bucket name for static files"
   type        = string
+}
+
+variable "data_bucket_name" {
+  description = "S3 bucket name for application data (census, etc.)"
+  type        = string
+  default     = "superschedules-data"
 }
 
 variable "health_check_path" {

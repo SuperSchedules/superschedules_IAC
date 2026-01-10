@@ -25,6 +25,8 @@ from rich import box
 
 from .aws_client import AWSClient
 from .config import Config
+from .ecr_client import ECRClient
+from .deploy_state import DeployState
 
 
 console = Console()
@@ -622,6 +624,549 @@ def deploy_and_flip(wait_seconds):
     success = manager.deploy_and_flip(wait_seconds=wait_seconds)
     if not success:
         sys.exit(1)
+
+
+@cli.command("deploy-when-ready")
+@click.option("--service", "-s", type=click.Choice(["api", "frontend", "all"]), default="all",
+              help="Service to deploy (default: all)")
+@click.option("--tag", "-t", default=None,
+              help="Image tag to deploy (default: main-<current-git-sha>)")
+@click.option("--timeout", default=1200, type=int,
+              help="Timeout in seconds (default: 1200 = 20 min)")
+@click.option("--no-flip", is_flag=True,
+              help="Deploy but do not flip traffic")
+def deploy_when_ready(service, tag, timeout, no_flip):
+    """Wait for ECR image to be ready, then deploy.
+
+    This command polls ECR until the specified image tag exists,
+    then deploys it to the inactive environment.
+
+    If no tag is provided, uses main-<current-git-sha> from the current directory.
+    """
+    ecr = ECRClient()
+    state = DeployState()
+
+    # Get tag from git if not provided
+    if tag is None:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            git_sha = result.stdout.strip()
+            tag = f"main-{git_sha}"
+            console.print(f"[dim]Using tag from git: {tag}[/dim]")
+        except Exception as e:
+            console.print(f"[red]Error getting git SHA: {e}[/red]")
+            console.print("[yellow]Please provide --tag explicitly[/yellow]")
+            sys.exit(1)
+
+    # Determine which repos to check
+    repos_to_check = []
+    if service in ["api", "all"]:
+        repos_to_check.append(("api", ecr.get_repo_name("api")))
+    if service in ["frontend", "all"]:
+        repos_to_check.append(("frontend", ecr.get_repo_name("frontend")))
+
+    console.print(f"\n[bold]Waiting for image tag: {tag}[/bold]")
+    console.print(f"Timeout: {timeout}s ({timeout // 60} min)\n")
+
+    # Wait for all required images
+    all_ready = True
+    for svc_name, repo_name in repos_to_check:
+        console.print(f"[cyan]Checking {svc_name}[/cyan] ({repo_name})...")
+
+        def progress_callback(attempt, elapsed, found):
+            status = "[green]FOUND[/green]" if found else "[yellow]waiting...[/yellow]"
+            console.print(f"  Attempt {attempt}, elapsed {elapsed}s: {status}", end="\r")
+
+        ready = ecr.wait_for_image(repo_name, tag, timeout=timeout, callback=progress_callback)
+        console.print()  # newline after progress
+
+        if ready:
+            console.print(f"  [green]✓ {svc_name} image ready[/green]")
+        else:
+            console.print(f"  [red]✗ {svc_name} image not found after {timeout}s[/red]")
+            all_ready = False
+
+    if not all_ready:
+        console.print("\n[red]Aborting: Not all images are ready[/red]")
+        sys.exit(1)
+
+    # Deploy using make target
+    console.print(f"\n[bold green]All images ready! Deploying...[/bold green]")
+
+    iac_root = get_iac_root()
+    result = subprocess.run(
+        ["make", f"deploy:with-tag", f"TAG={tag}"],
+        cwd=iac_root
+    )
+
+    if result.returncode != 0:
+        console.print("[red]Deployment failed[/red]")
+        sys.exit(1)
+
+    # Record deployment
+    state.record_deploy(tag, service)
+    console.print(f"[green]✓ Deployment recorded to history[/green]")
+
+    # Optionally flip traffic
+    if not no_flip:
+        console.print("\n[yellow]Waiting for new instances to become healthy...[/yellow]")
+        console.print("[dim]Run 'deploy-manager flip' when ready to switch traffic[/dim]")
+
+
+@cli.command("images")
+@click.option("--service", "-s", type=click.Choice(["api", "frontend"]), default="api",
+              help="Service to check (default: api)")
+@click.option("--limit", "-n", default=10, type=int,
+              help="Number of images to show (default: 10)")
+def images(service, limit):
+    """Show available images and currently deployed version."""
+    ecr = ECRClient()
+    state = DeployState()
+
+    repo_name = ecr.get_repo_name(service)
+    console.print(f"\n[bold]{repo_name}[/bold] images:\n")
+
+    # Get deployed tag from state
+    deployed_tag = state.get_current_tag()
+    if deployed_tag:
+        console.print(f"  [bold]Deployed:[/bold] {deployed_tag} [dim](from deploy history)[/dim]")
+    else:
+        console.print(f"  [bold]Deployed:[/bold] [dim]unknown[/dim]")
+
+    console.print()
+
+    # Get available images
+    images_list = ecr.get_latest_images(repo_name, limit=limit, tag_prefix="main-")
+
+    if not images_list:
+        console.print("  [yellow]No main-* tagged images found[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+    table.add_column("Tag", style="cyan")
+    table.add_column("Pushed", style="dim")
+    table.add_column("Status")
+
+    for img in images_list:
+        # Find the main-* tag
+        main_tag = None
+        for t in img["tags"]:
+            if t.startswith("main-"):
+                main_tag = t
+                break
+
+        if not main_tag:
+            continue
+
+        # Format pushed time
+        pushed_at = img["pushed_at"]
+        if pushed_at:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            delta = now - pushed_at
+            if delta.days > 0:
+                pushed_str = f"{delta.days}d ago"
+            elif delta.seconds > 3600:
+                pushed_str = f"{delta.seconds // 3600}h ago"
+            else:
+                pushed_str = f"{delta.seconds // 60}m ago"
+        else:
+            pushed_str = "unknown"
+
+        # Status indicator
+        if main_tag == deployed_tag:
+            status = "[green]← DEPLOYED[/green]"
+        elif images_list.index(img) == 0 and main_tag != deployed_tag:
+            status = "[yellow]← NEW[/yellow]"
+        else:
+            status = ""
+
+        table.add_row(main_tag, pushed_str, status)
+
+    console.print(table)
+
+
+@cli.command("rollback")
+@click.option("--to", "target_tag", default=None,
+              help="Specific tag to rollback to (default: previous deployment)")
+@click.option("--yes", "-y", is_flag=True,
+              help="Skip confirmation prompt")
+def rollback(target_tag, yes):
+    """Rollback to a previous deployment.
+
+    By default, rolls back to the previous deployed tag from history.
+    Use --to to specify a specific tag to rollback to.
+    """
+    state = DeployState()
+    ecr = ECRClient()
+
+    # Get target tag
+    if target_tag is None:
+        target_tag = state.get_previous_tag()
+        if not target_tag:
+            console.print("[red]No previous deployment found in history[/red]")
+            console.print("[dim]Use --to to specify a tag explicitly[/dim]")
+            sys.exit(1)
+        console.print(f"Rolling back to previous deployment: [cyan]{target_tag}[/cyan]")
+    else:
+        console.print(f"Rolling back to: [cyan]{target_tag}[/cyan]")
+
+    # Verify image exists in ECR
+    api_repo = ecr.get_repo_name("api")
+    if not ecr.image_exists(api_repo, target_tag):
+        console.print(f"[red]Image {target_tag} not found in ECR[/red]")
+        console.print("[dim]The image may have been cleaned up by lifecycle policy[/dim]")
+        sys.exit(1)
+
+    console.print(f"[green]✓ Image exists in ECR[/green]")
+
+    # Confirm
+    if not yes:
+        if not click.confirm("Proceed with rollback?"):
+            console.print("Rollback cancelled")
+            sys.exit(0)
+
+    # Deploy the rollback tag
+    console.print("\n[bold]Deploying rollback...[/bold]")
+
+    iac_root = get_iac_root()
+    result = subprocess.run(
+        ["make", f"deploy:with-tag", f"TAG={target_tag}"],
+        cwd=iac_root
+    )
+
+    if result.returncode != 0:
+        console.print("[red]Rollback deployment failed[/red]")
+        sys.exit(1)
+
+    # Record deployment
+    state.record_deploy(target_tag, "all")
+    console.print(f"\n[green]✓ Rollback deployed successfully[/green]")
+    console.print("[dim]Run 'deploy-manager flip' when ready to switch traffic[/dim]")
+
+
+@cli.command("history")
+@click.option("--limit", "-n", default=10, type=int,
+              help="Number of entries to show (default: 10)")
+def history(limit):
+    """Show deployment history."""
+    state = DeployState()
+
+    history_list = state.get_history(limit=limit)
+
+    if not history_list:
+        console.print("[yellow]No deployment history found[/yellow]")
+        return
+
+    console.print("\n[bold]Deployment History[/bold]\n")
+
+    table = Table(show_header=True, header_style="bold", box=box.SIMPLE)
+    table.add_column("#", style="dim")
+    table.add_column("Tag", style="cyan")
+    table.add_column("Service")
+    table.add_column("When", style="dim")
+    table.add_column("By")
+
+    for i, deploy in enumerate(history_list):
+        # Format timestamp
+        ts = deploy.get("timestamp", "")
+        if ts:
+            from datetime import datetime
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                from datetime import timezone
+                now = datetime.now(timezone.utc)
+                delta = now - dt
+                if delta.days > 0:
+                    when = f"{delta.days}d ago"
+                elif delta.seconds > 3600:
+                    when = f"{delta.seconds // 3600}h ago"
+                else:
+                    when = f"{delta.seconds // 60}m ago"
+            except Exception:
+                when = ts[:19]
+        else:
+            when = "unknown"
+
+        status = "[green]current[/green]" if i == 0 else str(i)
+        table.add_row(
+            status,
+            deploy.get("tag", "?"),
+            deploy.get("service", "all"),
+            when,
+            deploy.get("deployed_by", "?")
+        )
+
+    console.print(table)
+
+
+# =============================================================================
+# Prod-Lite Commands (non-Docker, fast deploys)
+# =============================================================================
+
+class ProdLiteManager:
+    """Manages prod-lite deployments via SSM."""
+
+    INSTANCE_NAME = "superschedules-prod-lite"
+    REGION = "us-east-1"
+
+    def __init__(self):
+        import boto3
+        self.ec2 = boto3.client("ec2", region_name=self.REGION)
+        self.ssm = boto3.client("ssm", region_name=self.REGION)
+
+    def get_instance(self) -> Optional[Dict]:
+        """Get the prod-lite instance."""
+        response = self.ec2.describe_instances(
+            Filters=[
+                {"Name": "tag:Name", "Values": [self.INSTANCE_NAME]},
+                {"Name": "instance-state-name", "Values": ["running"]}
+            ]
+        )
+        try:
+            return response["Reservations"][0]["Instances"][0]
+        except (IndexError, KeyError):
+            return None
+
+    def check_ssm_status(self, instance_id: str) -> bool:
+        """Check if instance is SSM-managed."""
+        response = self.ssm.describe_instance_information(
+            Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+        )
+        try:
+            status = response["InstanceInformationList"][0]["PingStatus"]
+            return status == "Online"
+        except (IndexError, KeyError):
+            return False
+
+    def run_command(self, instance_id: str, command: str, timeout: int = 300) -> tuple[bool, str]:
+        """Run a command via SSM and return (success, output)."""
+        try:
+            response = self.ssm.send_command(
+                InstanceIds=[instance_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [command]},
+                TimeoutSeconds=timeout
+            )
+            command_id = response["Command"]["CommandId"]
+
+            # Wait for command to complete
+            import time
+            for _ in range(timeout // 5):
+                time.sleep(5)
+                result = self.ssm.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id
+                )
+                status = result["Status"]
+                if status in ["Success", "Failed", "Cancelled", "TimedOut"]:
+                    break
+
+            output = result.get("StandardOutputContent", "")
+            error = result.get("StandardErrorContent", "")
+            success = result["Status"] == "Success"
+
+            return success, output if success else error
+        except Exception as e:
+            return False, str(e)
+
+
+@cli.group()
+def lite():
+    """Prod-lite environment commands (non-Docker, fast deploys)."""
+    pass
+
+
+@lite.command("status")
+def lite_status():
+    """Show prod-lite instance status."""
+    manager = ProdLiteManager()
+    instance = manager.get_instance()
+
+    if not instance:
+        console.print("[red]No running prod-lite instance found.[/red]")
+        console.print("[dim]Run 'make prod-lite-apply' to create one.[/dim]")
+        return
+
+    instance_id = instance["InstanceId"]
+    public_ip = instance.get("PublicIpAddress", "N/A")
+    launch_time = instance.get("LaunchTime", "N/A")
+    instance_type = instance.get("InstanceType", "N/A")
+
+    ssm_status = "Online" if manager.check_ssm_status(instance_id) else "Offline"
+
+    # Create status table
+    table = Table(title="Prod-Lite Instance", box=box.ROUNDED)
+    table.add_column("Property", style="cyan")
+    table.add_column("Value", style="white")
+
+    table.add_row("Instance ID", instance_id)
+    table.add_row("Public IP", public_ip)
+    table.add_row("Instance Type", instance_type)
+    table.add_row("Launch Time", str(launch_time))
+    table.add_row("SSM Status", f"[green]{ssm_status}[/green]" if ssm_status == "Online" else f"[red]{ssm_status}[/red]")
+
+    console.print(table)
+
+    # Show URLs
+    console.print("\n[bold]URLs:[/bold]")
+    console.print("  API:      https://api.eventzombie.com")
+    console.print("  Frontend: https://www.eventzombie.com")
+    console.print("  Admin:    https://admin.eventzombie.com")
+
+    # Show connect command
+    console.print(f"\n[bold]Connect via SSM:[/bold]")
+    console.print(f"  aws ssm start-session --target {instance_id} --region {manager.REGION}")
+
+
+@lite.command("deploy")
+@click.option("--service", "-s", type=click.Choice(["backend", "frontend", "all"]), default="all",
+              help="Which service to deploy")
+def lite_deploy(service):
+    """Deploy to prod-lite via SSM (fast ~30s deploy)."""
+    manager = ProdLiteManager()
+    instance = manager.get_instance()
+
+    if not instance:
+        console.print("[red]No running prod-lite instance found.[/red]")
+        sys.exit(1)
+
+    instance_id = instance["InstanceId"]
+
+    if not manager.check_ssm_status(instance_id):
+        console.print("[red]Instance is not SSM-managed or not online yet.[/red]")
+        console.print("[dim]Wait a few minutes for the instance to register with SSM.[/dim]")
+        sys.exit(1)
+
+    console.print(f"[bold]Deploying {service} to prod-lite...[/bold]\n")
+
+    if service in ["backend", "all"]:
+        console.print("[cyan]Deploying backend...[/cyan]")
+        cmd = """cd /opt/superschedules && \
+            sudo -u www-data git fetch origin && \
+            sudo -u www-data git reset --hard origin/main && \
+            sudo -u www-data /opt/superschedules/venv/bin/pip install -r requirements-prod.txt -q && \
+            sudo -u www-data /opt/superschedules/venv/bin/python manage.py migrate --noinput && \
+            sudo -u www-data /opt/superschedules/venv/bin/python manage.py collectstatic --noinput -v0 && \
+            sudo systemctl restart gunicorn celery-worker celery-beat && \
+            echo 'Backend deploy complete'"""
+
+        success, output = manager.run_command(instance_id, cmd, timeout=600)
+        if success:
+            console.print(f"[green]✓ Backend deployed[/green]")
+        else:
+            console.print(f"[red]✗ Backend deploy failed:[/red] {output}")
+            sys.exit(1)
+
+    if service in ["frontend", "all"]:
+        console.print("[cyan]Deploying frontend...[/cyan]")
+        cmd = """cd /opt/superschedules_frontend && \
+            sudo -u www-data git fetch origin && \
+            sudo -u www-data git reset --hard origin/main && \
+            sudo -u www-data pnpm install --frozen-lockfile 2>/dev/null || sudo -u www-data pnpm install && \
+            sudo -u www-data pnpm build && \
+            echo 'Frontend deploy complete'"""
+
+        success, output = manager.run_command(instance_id, cmd, timeout=600)
+        if success:
+            console.print(f"[green]✓ Frontend deployed[/green]")
+        else:
+            console.print(f"[red]✗ Frontend deploy failed:[/red] {output}")
+            sys.exit(1)
+
+    console.print("\n[bold green]Deployment complete![/bold green]")
+
+
+@lite.command("shell")
+def lite_shell():
+    """Open interactive SSM session to prod-lite instance."""
+    manager = ProdLiteManager()
+    instance = manager.get_instance()
+
+    if not instance:
+        console.print("[red]No running prod-lite instance found.[/red]")
+        sys.exit(1)
+
+    instance_id = instance["InstanceId"]
+    console.print(f"[cyan]Starting SSM session to {instance_id}...[/cyan]")
+
+    import os
+    os.execvp("aws", ["aws", "ssm", "start-session", "--target", instance_id, "--region", manager.REGION])
+
+
+@lite.command("logs")
+@click.option("--service", "-s", type=click.Choice(["gunicorn", "celery", "nginx", "all"]), default="all",
+              help="Which service logs to tail")
+@click.option("--follow", "-f", is_flag=True, help="Follow logs in real-time")
+def lite_logs(service, follow):
+    """Tail CloudWatch logs from prod-lite."""
+    log_group = "/aws/superschedules/prod-lite/app"
+
+    cmd = ["aws", "logs", "tail", log_group, "--region", "us-east-1"]
+
+    if follow:
+        cmd.append("--follow")
+
+    # Filter by service if specified
+    if service != "all":
+        stream_map = {
+            "gunicorn": "gunicorn-error",
+            "celery": "celery-worker",
+            "nginx": "nginx-error"
+        }
+        cmd.extend(["--log-stream-names", stream_map.get(service, service)])
+
+    console.print(f"[cyan]Tailing logs from {log_group}...[/cyan]")
+    console.print("[dim]Press Ctrl+C to stop[/dim]\n")
+
+    import os
+    os.execvp("aws", cmd)
+
+
+@lite.command("services")
+def lite_services():
+    """Check status of services on prod-lite instance."""
+    manager = ProdLiteManager()
+    instance = manager.get_instance()
+
+    if not instance:
+        console.print("[red]No running prod-lite instance found.[/red]")
+        sys.exit(1)
+
+    instance_id = instance["InstanceId"]
+
+    if not manager.check_ssm_status(instance_id):
+        console.print("[red]Instance is not SSM-managed.[/red]")
+        sys.exit(1)
+
+    console.print("[cyan]Checking services...[/cyan]\n")
+
+    cmd = """for svc in gunicorn celery-worker celery-beat nginx; do
+        status=$(systemctl is-active $svc 2>/dev/null || echo 'inactive')
+        echo "$svc: $status"
+    done"""
+
+    success, output = manager.run_command(instance_id, cmd, timeout=30)
+
+    if success:
+        table = Table(title="Service Status", box=box.ROUNDED)
+        table.add_column("Service", style="cyan")
+        table.add_column("Status", style="white")
+
+        for line in output.strip().split("\n"):
+            if ": " in line:
+                svc, status = line.split(": ", 1)
+                status_style = "[green]active[/green]" if status.strip() == "active" else f"[red]{status.strip()}[/red]"
+                table.add_row(svc, status_style)
+
+        console.print(table)
+    else:
+        console.print(f"[red]Failed to check services:[/red] {output}")
 
 
 if __name__ == "__main__":

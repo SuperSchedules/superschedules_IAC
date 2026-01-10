@@ -1,0 +1,23 @@
+# Prod-Lite Terraform Variables
+# Copy this file to terraform.tfvars and fill in your values
+
+# Required: Your email for Let's Encrypt certificate notifications
+certbot_email = "your-email@example.com"
+
+# Domains (defaults to production domains)
+# api_domain   = "api.eventzombie.com"
+# www_domain   = "www.eventzombie.com"
+# admin_domain = "admin.eventzombie.com"
+# apex_domain  = "eventzombie.com"
+
+# Optional: Override Git repo URLs if using different repos
+# backend_repo_url  = "https://github.com/your-org/superschedules.git"
+# frontend_repo_url = "https://github.com/your-org/superschedules_frontend.git"
+
+# Optional: Use different branches
+# backend_branch  = "main"
+# frontend_branch = "main"
+
+# Optional: Use a custom prebaked AMI for faster boot
+# use_custom_ami = true
+# custom_ami_id  = "ami-xxxxxxxxxxxxxxxxx"

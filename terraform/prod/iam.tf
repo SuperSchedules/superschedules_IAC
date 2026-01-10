@@ -46,6 +46,25 @@ resource "aws_iam_role_policy_attachment" "s3_access" {
   policy_arn = aws_iam_policy.s3_access.arn
 }
 
+# S3 read access for census data bucket
+resource "aws_iam_role_policy" "s3_data_read" {
+  name = "superschedules-prod-s3-data-read"
+  role = aws_iam_role.ec2.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = "arn:aws:s3:::${var.data_bucket_name}/census/*"
+      }
+    ]
+  })
+}
+
 data "aws_iam_policy_document" "bedrock_access" {
   statement {
     actions = [

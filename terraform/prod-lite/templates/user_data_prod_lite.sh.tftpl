@@ -1,0 +1,547 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Redirect output to log file (but don't use -x to avoid logging secrets)
+exec > >(tee /var/log/user_data.log) 2>&1
+echo "=== User data script started at $(date) ==="
+
+REGION="${region}"
+APP_DIR=/opt/superschedules
+FRONTEND_DIR=/opt/superschedules_frontend
+VENV_DIR=/opt/superschedules/venv
+LOG_DIR=/var/log/superschedules
+
+# Create directories
+mkdir -p "$APP_DIR" "$FRONTEND_DIR" "$LOG_DIR" /var/run/celery
+# SWAP FILE (4GB for sentence-transformers)
+
+if [ ! -f /swapfile ]; then
+  echo "Creating 4GB swap file..."
+  dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  sysctl vm.swappiness=10
+  echo 'vm.swappiness=10' >> /etc/sysctl.conf
+  echo "Swap created successfully"
+else
+  echo "Swap file already exists"
+fi
+
+%{ if !use_custom_ami }
+
+# INSTALL PACKAGES (skip if using custom AMI)
+
+echo "Installing packages..."
+export DEBIAN_FRONTEND=noninteractive
+
+# Add deadsnakes PPA for Python 3.12
+add-apt-repository -y ppa:deadsnakes/ppa
+
+# Add NodeSource for Node.js 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+
+apt-get update -y
+apt-get install -y \
+  python3.12 python3.12-venv python3.12-dev \
+  nodejs \
+  nginx certbot python3-certbot-nginx \
+  awscli jq git curl build-essential \
+  libpq-dev postgresql-client \
+  libcurl4-openssl-dev libssl-dev libcurl4
+
+# Install pnpm globally
+npm install -g pnpm
+
+# Install CloudWatch agent for log shipping
+wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i amazon-cloudwatch-agent.deb || apt-get -f install -y
+rm -f amazon-cloudwatch-agent.deb
+
+echo "Packages installed successfully"
+%{ endif }
+# CLONE REPOSITORIES
+
+echo "Cloning backend repository..."
+if [ -d "$APP_DIR/.git" ]; then
+  cd "$APP_DIR"
+  git fetch origin
+  git checkout "${backend_branch}"
+  git reset --hard "origin/${backend_branch}"
+else
+  rm -rf "$APP_DIR"/*
+  git clone --branch "${backend_branch}" "${backend_repo_url}" "$APP_DIR"
+fi
+
+echo "Cloning frontend repository..."
+if [ -d "$FRONTEND_DIR/.git" ]; then
+  cd "$FRONTEND_DIR"
+  git fetch origin
+  git checkout "${frontend_branch}"
+  git reset --hard "origin/${frontend_branch}"
+else
+  rm -rf "$FRONTEND_DIR"/*
+  git clone --branch "${frontend_branch}" "${frontend_repo_url}" "$FRONTEND_DIR"
+fi
+
+# Mark repos as safe for git (avoids "dubious ownership" errors when running as different user)
+git config --system --add safe.directory "$APP_DIR"
+git config --system --add safe.directory "$FRONTEND_DIR"
+# FETCH SECRETS AND CREATE .env FILE
+
+echo "Fetching secrets from Secrets Manager..."
+
+# Fetch secrets (output not logged)
+SECRET_JSON=$(aws secretsmanager get-secret-value \
+  --secret-id "${secrets_id}" \
+  --region "$REGION" \
+  --query SecretString \
+  --output text 2>/dev/null)
+
+# Write .env file with non-secret values
+cat > "$APP_DIR/.env" <<'ENVEOF'
+DJANGO_SETTINGS_MODULE=${django_settings_module}
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${db_name}
+DB_USER=${db_username}
+AWS_REGION=${region}
+USE_SQS_BROKER=True
+AWS_S3_BUCKET=${static_bucket}
+DEBUG=False
+LLM_PROVIDER=bedrock
+AWS_BEDROCK_REGION=${region}
+DEFAULT_FROM_EMAIL=noreply@eventzombie.com
+EMAIL_HOST=email-smtp.us-east-1.amazonaws.com
+EMAIL_PORT=587
+EMAIL_USE_TLS=True
+FRONTEND_URL=https://${www_domain}
+ENVEOF
+
+# Append secrets (not logged to console)
+{
+  echo "DJANGO_SECRET_KEY='$(echo "$SECRET_JSON" | jq -r '.DJANGO_SECRET_KEY')'"
+  echo "DB_PASSWORD='$(echo "$SECRET_JSON" | jq -r '.DB_PASSWORD')'"
+  echo "EMAIL_HOST_USER='$(echo "$SECRET_JSON" | jq -r '.EMAIL_HOST_USER // empty')'"
+  echo "EMAIL_HOST_PASSWORD='$(echo "$SECRET_JSON" | jq -r '.EMAIL_HOST_PASSWORD // empty')'"
+  echo "TURNSTILE_SECRET_KEY='$(echo "$SECRET_JSON" | jq -r '.TURNSTILE_SECRET_KEY // empty')'"
+} >> "$APP_DIR/.env" 2>/dev/null
+
+chmod 600 "$APP_DIR/.env"
+echo "Secrets written to .env file"
+# SETUP PYTHON VIRTUAL ENVIRONMENT
+
+echo "Setting up Python virtual environment..."
+python3.12 -m venv "$VENV_DIR"
+source "$VENV_DIR/bin/activate"
+
+cd "$APP_DIR"
+pip install --upgrade pip wheel
+
+# Pre-install PyTorch CPU-only version (~150MB vs ~2GB for CUDA version)
+# This prevents sentence-transformers from pulling the full CUDA version
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+pip install -r requirements-prod.txt
+
+echo "Python dependencies installed"
+# BUILD FRONTEND
+
+echo "Building frontend..."
+cd "$FRONTEND_DIR"
+
+# Create frontend .env for Vite build
+cat > .env <<FRONTENDENV
+VITE_API_BASE_URL=${vite_api_base_url}
+VITE_TURNSTILE_SITE_KEY=${vite_turnstile_site_key}
+FRONTENDENV
+
+pnpm install --frozen-lockfile || pnpm install
+pnpm build
+
+echo "Frontend built successfully"
+# CONFIGURE NGINX (Initial HTTP-only config for certbot)
+
+echo "Configuring nginx..."
+
+# Create temporary HTTP-only config for ACME challenge
+cat > /etc/nginx/sites-available/superschedules <<NGINXCONF
+# Temporary config for Let's Encrypt ACME challenge
+server {
+    listen 80;
+    server_name ${all_domains};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 503 "Setting up SSL...";
+    }
+}
+NGINXCONF
+
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/superschedules /etc/nginx/sites-enabled/superschedules
+
+nginx -t && systemctl restart nginx
+mkdir -p /var/www/html/.well-known/acme-challenge
+
+echo "Nginx configured for ACME challenge"
+# OBTAIN SSL CERTIFICATES
+
+echo "Waiting for DNS propagation (90 seconds)..."
+sleep 90
+
+echo "Obtaining SSL certificates with certbot..."
+
+# Build domain arguments for certbot
+CERTBOT_DOMAINS=""
+for domain in ${all_domains}; do
+  CERTBOT_DOMAINS="$CERTBOT_DOMAINS -d $domain"
+done
+
+# Try to get certificates with retries
+for attempt in 1 2 3 4 5; do
+  echo "Certbot attempt $attempt..."
+  if certbot certonly --webroot -w /var/www/html \
+    --non-interactive --agree-tos \
+    --email "${certbot_email}" \
+    $CERTBOT_DOMAINS; then
+    echo "SSL certificates obtained successfully"
+    break
+  fi
+  echo "Certbot failed, waiting 30s before retry..."
+  sleep 30
+done
+# CONFIGURE NGINX WITH SSL
+
+echo "Configuring nginx with SSL..."
+
+cat > /etc/nginx/sites-available/superschedules <<'NGINXCONF'
+# HTTP - redirect to HTTPS and handle ACME challenges
+server {
+    listen 80;
+    server_name ${api_domain} ${admin_domain} ${www_domain} ${apex_domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS - Apex domain redirect to www
+server {
+    listen 443 ssl http2;
+    server_name ${apex_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${api_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${api_domain}/privkey.pem;
+
+    return 301 https://${www_domain}$request_uri;
+}
+
+# HTTPS - API
+server {
+    listen 443 ssl http2;
+    server_name ${api_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${api_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${api_domain}/privkey.pem;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+        proxy_buffering off;
+    }
+}
+
+# HTTPS - Admin
+server {
+    listen 443 ssl http2;
+    server_name ${admin_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${api_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${api_domain}/privkey.pem;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# HTTPS - Frontend (static files)
+server {
+    listen 443 ssl http2;
+    server_name ${www_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${api_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${api_domain}/privkey.pem;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root /opt/superschedules_frontend/dist;
+    index index.html;
+
+    # SPA routing - serve index.html for all routes
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Static asset caching (Vite adds hashes to filenames)
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+}
+NGINXCONF
+
+nginx -t && systemctl reload nginx
+echo "Nginx SSL configuration complete"
+# CREATE SYSTEMD UNITS
+
+echo "Creating systemd units..."
+
+# Gunicorn service
+cat > /etc/systemd/system/gunicorn.service <<'GUNICORNUNIT'
+[Unit]
+Description=Gunicorn ASGI server for Superschedules
+After=network.target
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/superschedules
+EnvironmentFile=/opt/superschedules/.env
+ExecStart=/opt/superschedules/venv/bin/gunicorn config.asgi:application \
+  -k uvicorn.workers.UvicornWorker \
+  -b 127.0.0.1:8000 \
+  --workers ${gunicorn_workers} \
+  --timeout 120 \
+  --access-logfile /var/log/superschedules/gunicorn-access.log \
+  --error-logfile /var/log/superschedules/gunicorn-error.log
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+GUNICORNUNIT
+
+# Celery worker service
+cat > /etc/systemd/system/celery-worker.service <<'CELERYWORKERUNIT'
+[Unit]
+Description=Celery Worker for Superschedules
+After=network.target
+
+[Service]
+Type=forking
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/superschedules
+EnvironmentFile=/opt/superschedules/.env
+ExecStart=/opt/superschedules/venv/bin/celery \
+  -A config worker \
+  --loglevel=INFO \
+  --concurrency=${celery_concurrency} \
+  --queues=default,embeddings,geocoding,scraping \
+  --pidfile=/var/run/celery/worker.pid \
+  --logfile=/var/log/superschedules/celery-worker.log \
+  --detach
+ExecStop=/bin/kill -s TERM $MAINPID
+PIDFile=/var/run/celery/worker.pid
+RuntimeDirectory=celery
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+CELERYWORKERUNIT
+
+# Celery beat service
+cat > /etc/systemd/system/celery-beat.service <<'CELERYBEATUNIT'
+[Unit]
+Description=Celery Beat Scheduler for Superschedules
+After=network.target
+
+[Service]
+Type=forking
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/superschedules
+EnvironmentFile=/opt/superschedules/.env
+ExecStart=/opt/superschedules/venv/bin/celery \
+  -A config beat \
+  --loglevel=INFO \
+  --scheduler=django_celery_beat.schedulers:DatabaseScheduler \
+  --pidfile=/var/run/celery/beat.pid \
+  --logfile=/var/log/superschedules/celery-beat.log \
+  --detach
+ExecStop=/bin/kill -s TERM $MAINPID
+PIDFile=/var/run/celery/beat.pid
+RuntimeDirectory=celery
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+CELERYBEATUNIT
+
+# Set ownership
+# Create cache dirs for www-data (HuggingFace models, pnpm, etc)
+mkdir -p /var/www/.cache /var/www/.local/share/pnpm
+chown -R www-data:www-data "$APP_DIR" "$FRONTEND_DIR" "$LOG_DIR" /var/www/.cache /var/www/.local
+chown www-data:www-data /var/run/celery
+
+echo "Systemd units created"
+# DATABASE SETUP AND MIGRATIONS
+
+echo "Running database migrations..."
+cd "$APP_DIR"
+source "$VENV_DIR/bin/activate"
+set -a; source .env; set +a
+
+# Enable pgvector extension
+echo "Enabling pgvector extension..."
+python manage.py shell -c "
+from django.db import connection
+cursor = connection.cursor()
+cursor.execute('CREATE EXTENSION IF NOT EXISTS vector;')
+print('pgvector extension enabled')
+" 2>/dev/null || echo "pgvector setup skipped (may already exist)"
+
+# Run migrations
+python manage.py migrate --noinput
+echo "Migrations complete"
+
+# Collect static files
+python manage.py collectstatic --noinput
+echo "Static files collected"
+# START SERVICES
+
+echo "Starting services..."
+systemctl daemon-reload
+systemctl enable gunicorn celery-worker celery-beat nginx
+systemctl start gunicorn celery-worker celery-beat
+
+echo "Services started"
+# CONFIGURE CLOUDWATCH AGENT
+
+echo "Configuring CloudWatch agent..."
+
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWAGENT
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/superschedules/gunicorn-access.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "gunicorn-access"
+          },
+          {
+            "file_path": "/var/log/superschedules/gunicorn-error.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "gunicorn-error"
+          },
+          {
+            "file_path": "/var/log/superschedules/celery-worker.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "celery-worker"
+          },
+          {
+            "file_path": "/var/log/superschedules/celery-beat.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "celery-beat"
+          },
+          {
+            "file_path": "/var/log/nginx/access.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "nginx-access"
+          },
+          {
+            "file_path": "/var/log/nginx/error.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "nginx-error"
+          }
+        ]
+      }
+    }
+  }
+}
+CWAGENT
+
+systemctl enable amazon-cloudwatch-agent
+systemctl start amazon-cloudwatch-agent
+
+echo "CloudWatch agent configured"
+# CREATE DEPLOY HELPER SCRIPT
+
+mkdir -p /opt/superschedules/scripts
+cat > /opt/superschedules/scripts/deploy.sh <<'DEPLOYSCRIPT'
+#!/usr/bin/env bash
+# Quick deploy script - run on the instance to pull latest code and restart
+set -e
+
+echo "=== Deploying backend ==="
+cd /opt/superschedules
+sudo -u www-data git fetch origin
+sudo -u www-data git reset --hard origin/main
+sudo -u www-data bash -c 'source venv/bin/activate && set -a && source .env && set +a && pip install -r requirements-prod.txt -q && python manage.py migrate --noinput && python manage.py collectstatic --noinput'
+sudo systemctl restart gunicorn celery-worker celery-beat
+
+echo "=== Deploying frontend ==="
+cd /opt/superschedules_frontend
+sudo -u www-data git fetch origin
+sudo -u www-data git reset --hard origin/main
+sudo -u www-data bash -c 'pnpm install --frozen-lockfile || pnpm install'
+sudo -u www-data pnpm build
+
+echo "=== Deploy complete ==="
+DEPLOYSCRIPT
+
+chmod +x /opt/superschedules/scripts/deploy.sh
+
+echo "=== Bootstrap complete at $(date) ==="
+echo "API: https://${api_domain}"
+echo "Frontend: https://${www_domain}"
+echo "Admin: https://${admin_domain}"

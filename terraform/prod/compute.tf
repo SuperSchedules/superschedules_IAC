@@ -14,13 +14,14 @@ resource "aws_launch_template" "app" {
   user_data     = base64encode(templatefile("${path.module}/templates/user_data.sh.tftpl", {
     region          = var.aws_region,
     aws_account_id  = data.aws_caller_identity.current.account_id,
-    nginx_image     = var.nginx_image,
-    django_image    = var.django_image,
+    nginx_image     = local.nginx_image,
+    django_image    = local.django_image,
     db_host         = aws_db_instance.postgres.address,
     db_port         = 5432,
     db_name         = var.db_name,
     db_username     = var.db_username,
     static_bucket   = aws_s3_bucket.static.bucket,
+    data_bucket     = var.data_bucket_name,
     django_settings_module = var.django_settings_module,
     alb_dns_name    = aws_lb.app.dns_name
   }))

@@ -9,7 +9,7 @@ resource "aws_launch_template" "celery_beat" {
   user_data     = base64encode(templatefile("${path.module}/templates/celery_beat_user_data.sh.tftpl", {
     region                 = var.aws_region,
     aws_account_id         = data.aws_caller_identity.current.account_id,
-    django_image           = var.django_image,
+    django_image           = local.django_image,
     db_host                = aws_db_instance.postgres.address,
     db_port                = 5432,
     db_name                = var.db_name,

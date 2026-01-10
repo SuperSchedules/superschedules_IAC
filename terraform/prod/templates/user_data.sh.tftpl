@@ -168,5 +168,24 @@ docker exec "$DJANGO_CONTAINER" python manage.py shell -c "from django.db import
 # Run Django migrations (creates tables and enables pgvector)
 docker exec "$DJANGO_CONTAINER" python manage.py migrate --noinput || echo "Migration failed - may need manual intervention"
 
+# Seed locations from Census data (only runs if locations table is empty)
+echo "Checking location count..."
+# Capture count separately from stderr to avoid Django startup messages polluting the value
+LOCATION_COUNT=$(docker exec "$DJANGO_CONTAINER" python manage.py shell -c "from locations.models import Location; print(Location.objects.count())" 2>/dev/null | tail -1 | tr -d '[:space:]') || LOCATION_COUNT="error"
+echo "Location count: '$LOCATION_COUNT'"
+if [ "$LOCATION_COUNT" = "0" ] || [ "$LOCATION_COUNT" = "" ]; then
+  echo "Seeding locations from Census data..."
+  aws s3 cp s3://${data_bucket}/census/2023_Gaz_place_national.zip /tmp/ && \
+    docker cp /tmp/2023_Gaz_place_national.zip "$DJANGO_CONTAINER":/tmp/ && \
+    docker exec "$DJANGO_CONTAINER" python manage.py import_locations --source=census --file=/tmp/2023_Gaz_place_national.zip --skip-population
+  SEED_EXIT=$?
+  echo "Location seeding exit code: $SEED_EXIT"
+  if [ $SEED_EXIT -ne 0 ]; then
+    echo "ERROR: Location seeding failed. Check logs for details."
+  fi
+else
+  echo "Locations table has $LOCATION_COUNT records, skipping seed"
+fi
+
 echo "Bootstrapping complete"
 
