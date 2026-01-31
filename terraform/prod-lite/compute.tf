@@ -24,7 +24,7 @@ resource "aws_launch_template" "app" {
   image_id      = local.ami_id
   instance_type = var.instance_type
 
-  user_data = base64encode(templatefile("${path.module}/templates/user_data_prod_lite.sh.tftpl", {
+  user_data = base64gzip(templatefile("${path.module}/templates/user_data_prod_lite.sh.tftpl", {
     region                  = var.aws_region
     secrets_id              = var.secrets_manager_id
     backend_repo_url        = var.backend_repo_url
@@ -50,6 +50,14 @@ resource "aws_launch_template" "app" {
     vite_turnstile_site_key = var.vite_turnstile_site_key
     log_group               = local.log_group
     use_custom_ami          = var.use_custom_ami
+    # GKP Labs configuration
+    gkplabs_enabled       = var.gkplabs_enabled
+    gkplabs_repo_url      = var.gkplabs_repo_url
+    gkplabs_branch        = var.gkplabs_branch
+    gkplabs_domain        = var.gkplabs_domain
+    gkplabs_www_domain    = var.gkplabs_www_domain
+    gkplabs_db_name       = var.gkplabs_db_name
+    gkplabs_contact_email = var.gkplabs_contact_email
   }))
 
   iam_instance_profile {
@@ -72,13 +80,7 @@ resource "aws_launch_template" "app" {
     }
   }
 
-  # Spot instance configuration
-  instance_market_options {
-    market_type = "spot"
-    spot_options {
-      max_price = "" # Use current spot price (no cap)
-    }
-  }
+  # NOTE: Spot config moved to ASG mixed_instances_policy for multi-type support
 
   # Metadata options (IMDSv2 for security)
   metadata_options {
@@ -118,9 +120,31 @@ resource "aws_autoscaling_group" "app" {
   min_size            = 1
   max_size            = 1
 
-  launch_template {
-    id      = aws_launch_template.app.id
-    version = "$Latest"
+  # Mixed instances policy for better spot availability
+  mixed_instances_policy {
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.app.id
+        version            = "$Latest"
+      }
+
+      # Multiple small instance types (x86 only, no Graviton)
+      override {
+        instance_type = "t3.small"
+      }
+      override {
+        instance_type = "t3a.small"
+      }
+      override {
+        instance_type = "t2.small"
+      }
+    }
+
+    instances_distribution {
+      on_demand_base_capacity                  = 0
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "price-capacity-optimized"
+    }
   }
 
   health_check_type         = "EC2"

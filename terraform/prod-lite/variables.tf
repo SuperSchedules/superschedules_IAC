@@ -162,3 +162,55 @@ variable "vite_turnstile_site_key" {
   type        = string
   default     = "0x4AAAAAACHOkJ0SEFVIkN27"
 }
+
+# =============================================================================
+# GKP Labs Configuration (optional second site)
+# =============================================================================
+
+variable "gkplabs_enabled" {
+  description = "Enable GKP Labs site on this instance"
+  type        = bool
+  default     = false
+}
+
+variable "gkplabs_repo_url" {
+  description = "Git URL for GKP Labs repository (private, HTTPS)"
+  type        = string
+  default     = "https://github.com/gkirkpatrick/GKP_Labs_site.git"
+}
+
+variable "gkplabs_branch" {
+  description = "Git branch for GKP Labs"
+  type        = string
+  default     = "main"
+}
+
+variable "gkplabs_domain" {
+  description = "GKP Labs apex domain"
+  type        = string
+  default     = "gkplabs.com"
+}
+
+variable "gkplabs_www_domain" {
+  description = "GKP Labs www domain"
+  type        = string
+  default     = "www.gkplabs.com"
+}
+
+variable "gkplabs_db_name" {
+  description = "Database name for GKP Labs"
+  type        = string
+  default     = "gkplabs"
+}
+
+variable "gkplabs_domain_zone" {
+  description = "Route53 hosted zone for GKP Labs"
+  type        = string
+  default     = "gkplabs.com"
+}
+
+variable "gkplabs_contact_email" {
+  description = "Email address to receive GKP Labs contact form notifications"
+  type        = string
+  default     = ""
+}

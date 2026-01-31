@@ -61,35 +61,8 @@ rm -f amazon-cloudwatch-agent.deb
 
 echo "Packages installed successfully"
 %{ endif }
-# CLONE REPOSITORIES
 
-echo "Cloning backend repository..."
-if [ -d "$APP_DIR/.git" ]; then
-  cd "$APP_DIR"
-  git fetch origin
-  git checkout "${backend_branch}"
-  git reset --hard "origin/${backend_branch}"
-else
-  rm -rf "$APP_DIR"/*
-  git clone --branch "${backend_branch}" "${backend_repo_url}" "$APP_DIR"
-fi
-
-echo "Cloning frontend repository..."
-if [ -d "$FRONTEND_DIR/.git" ]; then
-  cd "$FRONTEND_DIR"
-  git fetch origin
-  git checkout "${frontend_branch}"
-  git reset --hard "origin/${frontend_branch}"
-else
-  rm -rf "$FRONTEND_DIR"/*
-  git clone --branch "${frontend_branch}" "${frontend_repo_url}" "$FRONTEND_DIR"
-fi
-
-# Mark repos as safe for git (avoids "dubious ownership" errors when running as different user)
-git config --system --add safe.directory "$APP_DIR"
-git config --system --add safe.directory "$FRONTEND_DIR"
-# FETCH SECRETS AND CREATE .env FILE
-
+# FETCH SECRETS (needed for GitHub PAT before cloning)
 echo "Fetching secrets from Secrets Manager..."
 
 # Fetch secrets (output not logged)
@@ -98,6 +71,56 @@ SECRET_JSON=$(aws secretsmanager get-secret-value \
   --region "$REGION" \
   --query SecretString \
   --output text 2>/dev/null)
+
+# Extract GitHub PAT for private repo access (if present)
+GITHUB_PAT=$(echo "$SECRET_JSON" | jq -r '.GITHUB_PAT // empty' 2>/dev/null)
+
+# Helper function to add PAT to git URL if available
+get_authenticated_url() {
+  local url="$1"
+  if [ -n "$GITHUB_PAT" ]; then
+    # Transform https://github.com/... to https://x-access-token:PAT@github.com/...
+    echo "$url" | sed "s|https://github.com|https://x-access-token:$GITHUB_PAT@github.com|"
+  else
+    echo "$url"
+  fi
+}
+
+# CLONE REPOSITORIES
+
+BACKEND_URL=$(get_authenticated_url "${backend_repo_url}")
+FRONTEND_URL=$(get_authenticated_url "${frontend_repo_url}")
+
+echo "Cloning backend repository..."
+if [ -d "$APP_DIR/.git" ]; then
+  cd "$APP_DIR"
+  # Update remote URL in case PAT changed
+  git remote set-url origin "$BACKEND_URL" 2>/dev/null || true
+  git fetch origin
+  git checkout "${backend_branch}"
+  git reset --hard "origin/${backend_branch}"
+else
+  rm -rf "$APP_DIR"/*
+  git clone --branch "${backend_branch}" "$BACKEND_URL" "$APP_DIR"
+fi
+
+echo "Cloning frontend repository..."
+if [ -d "$FRONTEND_DIR/.git" ]; then
+  cd "$FRONTEND_DIR"
+  git remote set-url origin "$FRONTEND_URL" 2>/dev/null || true
+  git fetch origin
+  git checkout "${frontend_branch}"
+  git reset --hard "origin/${frontend_branch}"
+else
+  rm -rf "$FRONTEND_DIR"/*
+  git clone --branch "${frontend_branch}" "$FRONTEND_URL" "$FRONTEND_DIR"
+fi
+
+# Mark repos as safe for git (avoids "dubious ownership" errors when running as different user)
+git config --system --add safe.directory "$APP_DIR"
+git config --system --add safe.directory "$FRONTEND_DIR"
+
+# SECRETS ALREADY FETCHED ABOVE - now create .env files
 
 # Write .env file with non-secret values
 cat > "$APP_DIR/.env" <<'ENVEOF'
@@ -117,6 +140,7 @@ EMAIL_HOST=email-smtp.us-east-1.amazonaws.com
 EMAIL_PORT=587
 EMAIL_USE_TLS=True
 FRONTEND_URL=https://${www_domain}
+EMBEDDING_SERVICE_URL=http://127.0.0.1:8003
 ENVEOF
 
 # Append secrets (not logged to console)
@@ -130,7 +154,9 @@ ENVEOF
 
 chmod 600 "$APP_DIR/.env"
 echo "Secrets written to .env file"
-# SETUP PYTHON VIRTUAL ENVIRONMENT
+
+%{ if !use_custom_ami }
+# SETUP PYTHON VIRTUAL ENVIRONMENT (skip if using custom AMI)
 
 echo "Setting up Python virtual environment..."
 python3.12 -m venv "$VENV_DIR"
@@ -146,7 +172,8 @@ pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements-prod.txt
 
 echo "Python dependencies installed"
-# BUILD FRONTEND
+
+# BUILD FRONTEND (skip if using custom AMI)
 
 echo "Building frontend..."
 cd "$FRONTEND_DIR"
@@ -161,7 +188,22 @@ pnpm install --frozen-lockfile || pnpm install
 pnpm build
 
 echo "Frontend built successfully"
+%{ else }
+# CUSTOM AMI: Skip venv and frontend build (already in AMI)
+echo "Using custom AMI - skipping venv and frontend build"
+source "$VENV_DIR/bin/activate"
+
+# Ensure frontend .env is correct for this environment
+cd "$FRONTEND_DIR"
+cat > .env <<FRONTENDENV
+VITE_API_BASE_URL=${vite_api_base_url}
+VITE_TURNSTILE_SITE_KEY=${vite_turnstile_site_key}
+FRONTENDENV
+%{ endif }
+
+%{ if !use_custom_ami }
 # CONFIGURE NGINX (Initial HTTP-only config for certbot)
+# Skip if using custom AMI - certs are already in the AMI
 
 echo "Configuring nginx..."
 
@@ -189,6 +231,7 @@ nginx -t && systemctl restart nginx
 mkdir -p /var/www/html/.well-known/acme-challenge
 
 echo "Nginx configured for ACME challenge"
+
 # OBTAIN SSL CERTIFICATES
 
 echo "Waiting for DNS propagation (90 seconds)..."
@@ -215,6 +258,13 @@ for attempt in 1 2 3 4 5; do
   echo "Certbot failed, waiting 30s before retry..."
   sleep 30
 done
+%{ else }
+# CUSTOM AMI: Skip certbot - SSL certificates already in AMI
+echo "Using custom AMI - skipping certbot (certs already in /etc/letsencrypt)"
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/superschedules /etc/nginx/sites-enabled/superschedules 2>/dev/null || true
+%{ endif }
+
 # CONFIGURE NGINX WITH SSL
 
 echo "Configuring nginx with SSL..."
@@ -425,6 +475,28 @@ RestartSec=10
 WantedBy=multi-user.target
 CELERYBEATUNIT
 
+# Embedding service (lightweight FastAPI for sentence embeddings)
+cat > /etc/systemd/system/embedding.service <<'EMBEDDINGUNIT'
+[Unit]
+Description=Embedding Service for Superschedules (sentence-transformers)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/superschedules
+EnvironmentFile=/opt/superschedules/.env
+ExecStart=/opt/superschedules/venv/bin/python -m uvicorn embedding_service.app:app --host 127.0.0.1 --port 8003 --workers 1
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/superschedules/embedding.log
+StandardError=append:/var/log/superschedules/embedding.log
+
+[Install]
+WantedBy=multi-user.target
+EMBEDDINGUNIT
+
 # Set ownership
 # Create cache dirs for www-data (HuggingFace models, pnpm, etc)
 mkdir -p /var/www/.cache /var/www/.local/share/pnpm
@@ -459,8 +531,8 @@ echo "Static files collected"
 
 echo "Starting services..."
 systemctl daemon-reload
-systemctl enable gunicorn celery-worker celery-beat nginx
-systemctl start gunicorn celery-worker celery-beat
+systemctl enable gunicorn celery-worker celery-beat embedding nginx
+systemctl start embedding gunicorn celery-worker celery-beat
 
 echo "Services started"
 # CONFIGURE CLOUDWATCH AGENT
@@ -494,6 +566,11 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWAGEN
             "log_stream_name": "celery-beat"
           },
           {
+            "file_path": "/var/log/superschedules/embedding.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "embedding"
+          },
+          {
             "file_path": "/var/log/nginx/access.log",
             "log_group_name": "${log_group}",
             "log_stream_name": "nginx-access"
@@ -520,28 +597,289 @@ mkdir -p /opt/superschedules/scripts
 cat > /opt/superschedules/scripts/deploy.sh <<'DEPLOYSCRIPT'
 #!/usr/bin/env bash
 # Quick deploy script - run on the instance to pull latest code and restart
+# Server stays up during git/pip/build, only restarts at the end (~10s downtime)
 set -e
 
-echo "=== Deploying backend ==="
+echo "=== Updating code (server stays up) ==="
 cd /opt/superschedules
-sudo -u www-data git fetch origin
-sudo -u www-data git reset --hard origin/main
-sudo -u www-data bash -c 'source venv/bin/activate && set -a && source .env && set +a && pip install -r requirements-prod.txt -q && python manage.py migrate --noinput && python manage.py collectstatic --noinput'
-sudo systemctl restart gunicorn celery-worker celery-beat
+git fetch origin
+git reset --hard origin/main
+chown -R www-data:www-data .
 
-echo "=== Deploying frontend ==="
 cd /opt/superschedules_frontend
-sudo -u www-data git fetch origin
-sudo -u www-data git reset --hard origin/main
+git fetch origin
+git reset --hard origin/main
+chown -R www-data:www-data .
+
+echo "=== Installing backend deps & running migrations ==="
+cd /opt/superschedules
+sudo -u www-data bash -c 'source venv/bin/activate && set -a && source .env && set +a && pip install -r requirements-prod.txt -q && python manage.py migrate --noinput && python manage.py collectstatic --noinput'
+
+echo "=== Building frontend ==="
+cd /opt/superschedules_frontend
 sudo -u www-data bash -c 'pnpm install --frozen-lockfile || pnpm install'
 sudo -u www-data pnpm build
+
+echo "=== Restarting services ==="
+sudo systemctl restart embedding gunicorn celery-worker celery-beat
 
 echo "=== Deploy complete ==="
 DEPLOYSCRIPT
 
 chmod +x /opt/superschedules/scripts/deploy.sh
 
+%{ if gkplabs_enabled }
+# =============================================================================
+# GKP LABS SETUP
+# =============================================================================
+
+GKPLABS_DIR=/opt/gkp_labs
+GKPLABS_VENV=/opt/gkp_labs/venv
+GKPLABS_LOG_DIR=/var/log/gkplabs
+
+echo "=== Setting up GKP Labs ==="
+mkdir -p "$GKPLABS_DIR" "$GKPLABS_LOG_DIR"
+
+# Clone GKP Labs repository (use authenticated URL for private repo)
+GKPLABS_URL=$(get_authenticated_url "${gkplabs_repo_url}")
+
+echo "Cloning GKP Labs repository..."
+if [ -d "$GKPLABS_DIR/.git" ]; then
+  cd "$GKPLABS_DIR"
+  git remote set-url origin "$GKPLABS_URL" 2>/dev/null || true
+  git fetch origin
+  git checkout "${gkplabs_branch}"
+  git reset --hard "origin/${gkplabs_branch}"
+else
+  rm -rf "$GKPLABS_DIR"/*
+  git clone --branch "${gkplabs_branch}" "$GKPLABS_URL" "$GKPLABS_DIR"
+fi
+
+git config --system --add safe.directory "$GKPLABS_DIR"
+
+# Create GKP Labs venv
+echo "Setting up GKP Labs Python environment..."
+python3.12 -m venv "$GKPLABS_VENV"
+source "$GKPLABS_VENV/bin/activate"
+pip install --upgrade pip wheel
+pip install -r "$GKPLABS_DIR/requirements.txt"
+
+# Create GKP Labs .env file
+cat > "$GKPLABS_DIR/.env" <<'GKPLABSENV'
+DJANGO_SETTINGS_MODULE=config.settings
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${gkplabs_db_name}
+DB_USER=${db_username}
+DEBUG=False
+GKPLABSENV
+
+# Append secrets (reuse from superschedules)
+{
+  echo "DJANGO_SECRET_KEY='$(echo "$SECRET_JSON" | jq -r '.DJANGO_SECRET_KEY')'"
+  echo "DB_PASSWORD='$(echo "$SECRET_JSON" | jq -r '.DB_PASSWORD')'"
+  # Email settings for contact form notifications
+  echo "EMAIL_BACKEND='django.core.mail.backends.smtp.EmailBackend'"
+  echo "EMAIL_HOST='email-smtp.us-east-1.amazonaws.com'"
+  echo "EMAIL_PORT='587'"
+  echo "EMAIL_USE_TLS='True'"
+  echo "EMAIL_HOST_USER='$(echo "$SECRET_JSON" | jq -r '.EMAIL_HOST_USER')'"
+  echo "EMAIL_HOST_PASSWORD='$(echo "$SECRET_JSON" | jq -r '.EMAIL_HOST_PASSWORD')'"
+  echo "DEFAULT_FROM_EMAIL='noreply@eventzombie.com'"
+  echo "CONTACT_NOTIFICATION_EMAIL='${gkplabs_contact_email}'"
+} >> "$GKPLABS_DIR/.env" 2>/dev/null
+
+chmod 600 "$GKPLABS_DIR/.env"
+
+# Create gkplabs database if it doesn't exist
+echo "Creating GKP Labs database..."
+cd "$GKPLABS_DIR"
+source "$GKPLABS_VENV/bin/activate"
+set -a; source .env; set +a
+
+# Use psql to create database (connect to postgres db to create gkplabs db)
+export PGPASSWORD="$DB_PASSWORD"
+psql -h "${db_host}" -U "${db_username}" -d postgres -c "CREATE DATABASE ${gkplabs_db_name};" 2>/dev/null || echo "Database ${gkplabs_db_name} may already exist"
+
+# Run GKP Labs migrations
+python manage.py migrate --noinput
+python manage.py collectstatic --noinput
+echo "GKP Labs migrations complete"
+
+# Create gunicorn-gkplabs systemd service
+cat > /etc/systemd/system/gunicorn-gkplabs.service <<'GKPLABSUNIT'
+[Unit]
+Description=Gunicorn WSGI server for GKP Labs
+After=network.target
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/gkp_labs
+EnvironmentFile=/opt/gkp_labs/.env
+ExecStart=/opt/gkp_labs/venv/bin/gunicorn config.wsgi:application \
+  -b 127.0.0.1:8001 \
+  --workers 2 \
+  --timeout 120 \
+  --access-logfile /var/log/gkplabs/gunicorn-access.log \
+  --error-logfile /var/log/gkplabs/gunicorn-error.log
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+GKPLABSUNIT
+
+# Set ownership
+chown -R www-data:www-data "$GKPLABS_DIR" "$GKPLABS_LOG_DIR"
+
+# Add GKP Labs nginx config
+cat >> /etc/nginx/sites-available/superschedules <<'GKPLABSNGINX'
+
+# =============================================================================
+# GKP Labs Configuration
+# =============================================================================
+
+# HTTP - redirect to HTTPS for GKP Labs
+server {
+    listen 80;
+    server_name ${gkplabs_domain} ${gkplabs_www_domain};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS - GKP Labs apex redirect to www
+server {
+    listen 443 ssl http2;
+    server_name ${gkplabs_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${api_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${api_domain}/privkey.pem;
+
+    return 301 https://${gkplabs_www_domain}$request_uri;
+}
+
+# HTTPS - GKP Labs www (main site)
+server {
+    listen 443 ssl http2;
+    server_name ${gkplabs_www_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${api_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${api_domain}/privkey.pem;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    # Static files
+    location /static/ {
+        alias /opt/gkp_labs/staticfiles/;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Proxy to gunicorn-gkplabs
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+GKPLABSNGINX
+
+nginx -t && systemctl reload nginx
+
+# Add GKP Labs to CloudWatch agent config
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWAGENT
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/superschedules/gunicorn-access.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "gunicorn-access"
+          },
+          {
+            "file_path": "/var/log/superschedules/gunicorn-error.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "gunicorn-error"
+          },
+          {
+            "file_path": "/var/log/superschedules/celery-worker.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "celery-worker"
+          },
+          {
+            "file_path": "/var/log/superschedules/celery-beat.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "celery-beat"
+          },
+          {
+            "file_path": "/var/log/superschedules/embedding.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "embedding"
+          },
+          {
+            "file_path": "/var/log/nginx/access.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "nginx-access"
+          },
+          {
+            "file_path": "/var/log/nginx/error.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "nginx-error"
+          },
+          {
+            "file_path": "/var/log/gkplabs/gunicorn-access.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "gkplabs-access"
+          },
+          {
+            "file_path": "/var/log/gkplabs/gunicorn-error.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "gkplabs-error"
+          }
+        ]
+      }
+    }
+  }
+}
+CWAGENT
+
+systemctl restart amazon-cloudwatch-agent
+
+# Enable and start GKP Labs service
+systemctl daemon-reload
+systemctl enable gunicorn-gkplabs
+systemctl start gunicorn-gkplabs
+
+echo "GKP Labs setup complete"
+echo "GKP Labs: https://${gkplabs_www_domain}"
+%{ endif }
+
 echo "=== Bootstrap complete at $(date) ==="
 echo "API: https://${api_domain}"
 echo "Frontend: https://${www_domain}"
 echo "Admin: https://${admin_domain}"
+%{ if gkplabs_enabled }
+echo "GKP Labs: https://${gkplabs_www_domain}"
+%{ endif }

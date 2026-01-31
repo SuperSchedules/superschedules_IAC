@@ -915,6 +915,24 @@ class ProdLiteManager:
     INSTANCE_NAME = "superschedules-prod-lite"
     REGION = "us-east-1"
 
+    # Apps hosted on prod-lite instance
+    APPS = {
+        "superschedules": {
+            "dir": "/opt/superschedules",
+            "frontend_dir": "/opt/superschedules_frontend",
+            "services": ["embedding", "gunicorn", "celery-worker", "celery-beat"],
+            "has_frontend": True,
+            "branch": "main",
+        },
+        "gkp-labs": {
+            "dir": "/opt/gkp_labs",
+            "frontend_dir": None,
+            "services": ["gunicorn-gkplabs"],
+            "has_frontend": False,
+            "branch": "main",
+        }
+    }
+
     def __init__(self):
         import boto3
         self.ec2 = boto3.client("ec2", region_name=self.REGION)
@@ -975,6 +993,60 @@ class ProdLiteManager:
         except Exception as e:
             return False, str(e)
 
+    def deploy_app(self, instance_id: str, app_name: str) -> bool:
+        """Deploy a specific app (gkp-labs or superschedules)."""
+        if app_name not in self.APPS:
+            console.print(f"[red]Unknown app: {app_name}[/red]")
+            console.print(f"[dim]Available apps: {', '.join(self.APPS.keys())}[/dim]")
+            return False
+
+        app = self.APPS[app_name]
+        app_dir = app["dir"]
+        branch = app["branch"]
+        services = app["services"]
+
+        console.print(f"[bold magenta]Deploying {app_name}...[/bold magenta]\n")
+
+        # Step 1: Update code
+        console.print(f"[cyan]Updating {app_name} code...[/cyan]")
+        cmd = f"""cd {app_dir} && \
+            git fetch origin && \
+            git reset --hard origin/{branch} && \
+            chown -R www-data:www-data . && \
+            echo 'Code updated'"""
+        success, output = self.run_command(instance_id, cmd, timeout=120)
+        if not success:
+            console.print(f"[red]✗ Git failed:[/red] {output}")
+            return False
+        console.print(f"[green]✓ {app_name} code updated[/green]")
+
+        # Step 2: Install deps & migrate
+        console.print(f"[cyan]Installing dependencies & running migrations...[/cyan]")
+        cmd = f"""cd {app_dir} && \
+            sudo -u www-data bash -c 'source venv/bin/activate && set -a && source .env && set +a && \
+                pip install -r requirements.txt -q && \
+                python manage.py migrate --noinput && \
+                python manage.py collectstatic --noinput -v0' && \
+            echo 'Dependencies installed'"""
+        success, output = self.run_command(instance_id, cmd, timeout=600)
+        if not success:
+            console.print(f"[red]✗ Dependencies/migrate failed:[/red] {output}")
+            return False
+        console.print(f"[green]✓ Dependencies installed[/green]")
+
+        # Step 3: Restart services
+        services_str = " ".join(services)
+        console.print(f"[cyan]Restarting services ({services_str})...[/cyan]")
+        cmd = f"sudo systemctl restart {services_str} && echo 'Services restarted'"
+        success, output = self.run_command(instance_id, cmd, timeout=60)
+        if not success:
+            console.print(f"[red]✗ Service restart failed:[/red] {output}")
+            return False
+        console.print(f"[green]✓ Services restarted[/green]")
+
+        console.print(f"\n[bold green]{app_name} deployment complete![/bold green]")
+        return True
+
 
 @cli.group()
 def lite():
@@ -1021,14 +1093,26 @@ def lite_status():
 
     # Show connect command
     console.print(f"\n[bold]Connect via SSM:[/bold]")
+    console.print(f"  deploy-manager lite shell              # Interactive bash (as www-data)")
+    console.print(f"  deploy-manager lite shell --root       # Interactive bash (as root)")
     console.print(f"  aws ssm start-session --target {instance_id} --region {manager.REGION}")
 
 
 @lite.command("deploy")
 @click.option("--service", "-s", type=click.Choice(["backend", "frontend", "all"]), default="all",
-              help="Which service to deploy")
-def lite_deploy(service):
-    """Deploy to prod-lite via SSM (fast ~30s deploy)."""
+              help="Which service to deploy (for superschedules)")
+@click.option("--app", "-a", type=click.Choice(["superschedules", "gkp-labs", "all"]), default="superschedules",
+              help="Which app to deploy")
+def lite_deploy(service, app):
+    """Deploy to prod-lite via SSM (fast ~30s deploy).
+
+    By default, deploys superschedules. Use --app to specify a different app:
+
+    \b
+      deploy-manager lite deploy                    # Deploy superschedules (default)
+      deploy-manager lite deploy --app gkp-labs    # Deploy GKP Labs
+      deploy-manager lite deploy --app all         # Deploy all apps
+    """
     manager = ProdLiteManager()
     instance = manager.get_instance()
 
@@ -1043,19 +1127,99 @@ def lite_deploy(service):
         console.print("[dim]Wait a few minutes for the instance to register with SSM.[/dim]")
         sys.exit(1)
 
-    console.print(f"[bold]Deploying {service} to prod-lite...[/bold]\n")
+    # Handle GKP Labs deployment
+    if app == "gkp-labs":
+        success = manager.deploy_app(instance_id, "gkp-labs")
+        if not success:
+            sys.exit(1)
+        return
 
-    if service in ["backend", "all"]:
+    # Handle "all" apps deployment
+    if app == "all":
+        console.print("[bold cyan]Deploying all apps...[/bold cyan]\n")
+
+        # Deploy superschedules first (with frontend)
+        console.print("[bold]1/2 Deploying superschedules...[/bold]")
+        # Fall through to superschedules deployment below
+
+        # We'll deploy gkp-labs after superschedules
+        deploy_gkplabs_after = True
+    else:
+        deploy_gkplabs_after = False
+
+    # Original superschedules deployment logic
+    console.print(f"[bold]Deploying {service} to prod-lite (superschedules)...[/bold]\n")
+
+    if service == "all":
+        # Deploy both backend and frontend, then restart once at the end
+        console.print("[cyan]Updating backend code...[/cyan]")
+        cmd = """cd /opt/superschedules && \
+            git fetch origin && \
+            git reset --hard origin/main && \
+            chown -R www-data:www-data . && \
+            echo 'Backend code updated'"""
+        success, output = manager.run_command(instance_id, cmd, timeout=120)
+        if not success:
+            console.print(f"[red]✗ Backend git failed:[/red] {output}")
+            sys.exit(1)
+        console.print("[green]✓ Backend code updated[/green]")
+
+        console.print("[cyan]Updating frontend code...[/cyan]")
+        cmd = """cd /opt/superschedules_frontend && \
+            git fetch origin && \
+            git reset --hard origin/main && \
+            chown -R www-data:www-data . && \
+            echo 'Frontend code updated'"""
+        success, output = manager.run_command(instance_id, cmd, timeout=120)
+        if not success:
+            console.print(f"[red]✗ Frontend git failed:[/red] {output}")
+            sys.exit(1)
+        console.print("[green]✓ Frontend code updated[/green]")
+
+        console.print("[cyan]Installing backend dependencies & running migrations...[/cyan]")
+        cmd = """cd /opt/superschedules && \
+            sudo -u www-data bash -c 'source venv/bin/activate && set -a && source .env && set +a && \
+                pip install -r requirements-prod.txt -q && \
+                python manage.py migrate --noinput && \
+                python manage.py collectstatic --noinput -v0' && \
+            echo 'Backend deps installed'"""
+        success, output = manager.run_command(instance_id, cmd, timeout=600)
+        if not success:
+            console.print(f"[red]✗ Backend deps/migrate failed:[/red] {output}")
+            sys.exit(1)
+        console.print("[green]✓ Backend dependencies installed[/green]")
+
+        console.print("[cyan]Building frontend...[/cyan]")
+        cmd = """cd /opt/superschedules_frontend && \
+            sudo -u www-data bash -c 'pnpm install --frozen-lockfile 2>/dev/null || pnpm install' && \
+            sudo -u www-data pnpm build && \
+            echo 'Frontend built'"""
+        success, output = manager.run_command(instance_id, cmd, timeout=600)
+        if not success:
+            console.print(f"[red]✗ Frontend build failed:[/red] {output}")
+            sys.exit(1)
+        console.print("[green]✓ Frontend built[/green]")
+
+        console.print("[cyan]Restarting services...[/cyan]")
+        cmd = "sudo systemctl restart embedding gunicorn celery-worker celery-beat && echo 'Services restarted'"
+        success, output = manager.run_command(instance_id, cmd, timeout=60)
+        if not success:
+            console.print(f"[red]✗ Service restart failed:[/red] {output}")
+            sys.exit(1)
+        console.print("[green]✓ Services restarted[/green]")
+
+    elif service == "backend":
         console.print("[cyan]Deploying backend...[/cyan]")
         cmd = """cd /opt/superschedules && \
-            sudo -u www-data git fetch origin && \
-            sudo -u www-data git reset --hard origin/main && \
-            sudo -u www-data /opt/superschedules/venv/bin/pip install -r requirements-prod.txt -q && \
-            sudo -u www-data /opt/superschedules/venv/bin/python manage.py migrate --noinput && \
-            sudo -u www-data /opt/superschedules/venv/bin/python manage.py collectstatic --noinput -v0 && \
-            sudo systemctl restart gunicorn celery-worker celery-beat && \
+            git fetch origin && \
+            git reset --hard origin/main && \
+            chown -R www-data:www-data . && \
+            sudo -u www-data bash -c 'source venv/bin/activate && set -a && source .env && set +a && \
+                pip install -r requirements-prod.txt -q && \
+                python manage.py migrate --noinput && \
+                python manage.py collectstatic --noinput -v0' && \
+            sudo systemctl restart embedding gunicorn celery-worker celery-beat && \
             echo 'Backend deploy complete'"""
-
         success, output = manager.run_command(instance_id, cmd, timeout=600)
         if success:
             console.print(f"[green]✓ Backend deployed[/green]")
@@ -1063,15 +1227,15 @@ def lite_deploy(service):
             console.print(f"[red]✗ Backend deploy failed:[/red] {output}")
             sys.exit(1)
 
-    if service in ["frontend", "all"]:
+    elif service == "frontend":
         console.print("[cyan]Deploying frontend...[/cyan]")
         cmd = """cd /opt/superschedules_frontend && \
-            sudo -u www-data git fetch origin && \
-            sudo -u www-data git reset --hard origin/main && \
-            sudo -u www-data pnpm install --frozen-lockfile 2>/dev/null || sudo -u www-data pnpm install && \
+            git fetch origin && \
+            git reset --hard origin/main && \
+            chown -R www-data:www-data . && \
+            sudo -u www-data bash -c 'pnpm install --frozen-lockfile 2>/dev/null || pnpm install' && \
             sudo -u www-data pnpm build && \
             echo 'Frontend deploy complete'"""
-
         success, output = manager.run_command(instance_id, cmd, timeout=600)
         if success:
             console.print(f"[green]✓ Frontend deployed[/green]")
@@ -1079,12 +1243,37 @@ def lite_deploy(service):
             console.print(f"[red]✗ Frontend deploy failed:[/red] {output}")
             sys.exit(1)
 
-    console.print("\n[bold green]Deployment complete![/bold green]")
+    console.print("\n[bold green]Superschedules deployment complete![/bold green]")
+
+    # Deploy GKP Labs if --app all was specified
+    if deploy_gkplabs_after:
+        console.print("\n[bold]2/2 Deploying gkp-labs...[/bold]")
+        success = manager.deploy_app(instance_id, "gkp-labs")
+        if not success:
+            console.print("[yellow]Warning: GKP Labs deployment failed, but superschedules deployed successfully.[/yellow]")
+        else:
+            console.print("\n[bold green]All apps deployed successfully![/bold green]")
 
 
 @lite.command("shell")
-def lite_shell():
-    """Open interactive SSM session to prod-lite instance."""
+@click.option("--root", "-r", is_flag=True, help="Start as root (default starts bash as www-data)")
+def lite_shell(root):
+    """Open interactive SSM session to prod-lite instance.
+
+    Starts a bash shell on the prod-lite instance via SSM (no SSH keys needed).
+    By default runs as www-data user in /opt/superschedules.
+
+    \b
+    Common uses:
+      - Run Django management commands (e.g., createsuperuser, shell_plus)
+      - Debug issues on the instance
+      - Check logs in /var/log/superschedules/
+
+    \b
+    Examples:
+      deploy-manager lite shell                # Shell as www-data
+      deploy-manager lite shell --root         # Shell as root
+    """
     manager = ProdLiteManager()
     instance = manager.get_instance()
 
@@ -1093,10 +1282,22 @@ def lite_shell():
         sys.exit(1)
 
     instance_id = instance["InstanceId"]
-    console.print(f"[cyan]Starting SSM session to {instance_id}...[/cyan]")
+
+    if root:
+        console.print(f"[cyan]Starting bash session to {instance_id} (as root)...[/cyan]")
+        shell_cmd = "cd /opt/superschedules && bash -l"
+    else:
+        console.print(f"[cyan]Starting bash session to {instance_id} (as www-data)...[/cyan]")
+        shell_cmd = "cd /opt/superschedules && sudo -u www-data bash -l"
 
     import os
-    os.execvp("aws", ["aws", "ssm", "start-session", "--target", instance_id, "--region", manager.REGION])
+    os.execvp("aws", [
+        "aws", "ssm", "start-session",
+        "--target", instance_id,
+        "--region", manager.REGION,
+        "--document-name", "AWS-StartInteractiveCommand",
+        "--parameters", f"command={shell_cmd}"
+    ])
 
 
 @lite.command("logs")
@@ -1146,7 +1347,7 @@ def lite_services():
 
     console.print("[cyan]Checking services...[/cyan]\n")
 
-    cmd = """for svc in gunicorn celery-worker celery-beat nginx; do
+    cmd = """for svc in embedding gunicorn celery-worker celery-beat nginx; do
         status=$(systemctl is-active $svc 2>/dev/null || echo 'inactive')
         echo "$svc: $status"
     done"""
@@ -1167,6 +1368,114 @@ def lite_services():
         console.print(table)
     else:
         console.print(f"[red]Failed to check services:[/red] {output}")
+
+
+@lite.command("restart")
+@click.option("--service", "-s", type=click.Choice(["gunicorn", "celery", "embedding", "all"]), default="all",
+              help="Which service to restart")
+def lite_restart(service):
+    """Restart services without deploying (no git pull/build)."""
+    manager = ProdLiteManager()
+    instance = manager.get_instance()
+
+    if not instance:
+        console.print("[red]No running prod-lite instance found.[/red]")
+        sys.exit(1)
+
+    instance_id = instance["InstanceId"]
+
+    if not manager.check_ssm_status(instance_id):
+        console.print("[red]Instance is not SSM-managed.[/red]")
+        sys.exit(1)
+
+    services_map = {
+        "gunicorn": ["gunicorn"],
+        "celery": ["celery-worker", "celery-beat"],
+        "embedding": ["embedding"],
+        "all": ["embedding", "gunicorn", "celery-worker", "celery-beat"]
+    }
+
+    services_to_restart = services_map[service]
+    services_str = " ".join(services_to_restart)
+
+    console.print(f"[cyan]Restarting {services_str}...[/cyan]")
+
+    cmd = f"sudo systemctl restart {services_str} && echo 'Services restarted successfully'"
+
+    success, output = manager.run_command(instance_id, cmd, timeout=60)
+
+    if success:
+        console.print(f"[green]✓ Restarted: {services_str}[/green]")
+    else:
+        console.print(f"[red]✗ Failed to restart services:[/red] {output}")
+        sys.exit(1)
+
+
+@lite.command("ami")
+@click.option("--name", "-n", help="Custom AMI name (default: auto-generated with timestamp)")
+@click.option("--no-reboot", is_flag=True, help="Create AMI without rebooting instance")
+def lite_ami(name, no_reboot):
+    """Create an AMI from the current prod-lite instance for faster launches."""
+    import boto3
+    from datetime import datetime
+
+    manager = ProdLiteManager()
+    instance = manager.get_instance()
+
+    if not instance:
+        console.print("[red]No running prod-lite instance found.[/red]")
+        sys.exit(1)
+
+    instance_id = instance["InstanceId"]
+
+    # Generate AMI name if not provided
+    if not name:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"superschedules-prod-lite-{timestamp}"
+
+    console.print(f"[cyan]Creating AMI from {instance_id}...[/cyan]")
+    console.print(f"  Name: {name}")
+    console.print(f"  No-reboot: {no_reboot}")
+
+    if not no_reboot:
+        console.print("[yellow]⚠ Instance will be rebooted during AMI creation[/yellow]")
+        if not click.confirm("Continue?", default=True):
+            console.print("[dim]Cancelled[/dim]")
+            return
+
+    ec2 = boto3.client("ec2", region_name=manager.REGION)
+
+    try:
+        response = ec2.create_image(
+            InstanceId=instance_id,
+            Name=name,
+            Description=f"Superschedules prod-lite AMI created from {instance_id}",
+            NoReboot=no_reboot,
+            TagSpecifications=[
+                {
+                    "ResourceType": "image",
+                    "Tags": [
+                        {"Key": "Name", "Value": name},
+                        {"Key": "Environment", "Value": "prod-lite"},
+                        {"Key": "SourceInstance", "Value": instance_id},
+                        {"Key": "CreatedBy", "Value": "deploy-manager"}
+                    ]
+                }
+            ]
+        )
+
+        ami_id = response["ImageId"]
+        console.print(f"\n[green]✓ AMI creation started![/green]")
+        console.print(f"  AMI ID: [bold]{ami_id}[/bold]")
+        console.print(f"\n[dim]AMI will be available in a few minutes. Check status with:[/dim]")
+        console.print(f"  aws ec2 describe-images --image-ids {ami_id} --query 'Images[0].State'")
+
+        console.print(f"\n[dim]To use this AMI, update terraform/prod-lite/compute.tf:[/dim]")
+        console.print(f'  ami_id = "{ami_id}"')
+
+    except Exception as e:
+        console.print(f"[red]✗ Failed to create AMI:[/red] {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
